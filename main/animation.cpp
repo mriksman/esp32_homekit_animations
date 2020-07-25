@@ -2,6 +2,7 @@
 #include "freertos/task.h"
 
 #include <sys/param.h>   
+#include <atomic>                       // note: this is a cpp file, so use <atomic>, not <stdatomic.h>
 
 #include "esp_log.h"
 static const char *TAG = "anim";
@@ -28,35 +29,44 @@ NeoPixelAnimator animations(PixelCount, NEO_CENTISECONDS);
 
 static QueueHandle_t s_led_message_queue;
 
+// let the compiler know that this variable can be updated from another thread at any time
+// this is faster than using a mutex
+std::atomic<int> atomic_brightness (100);
 
-// Transistion between colours wasn't smooth when trying to have each pixel a 
-// separate animation
+
+
+// *********** This is the standard animation for on/off ******************
 void FadeAnimationSet(HsbColor targetColor, int8_t direction)
 {
+    // convert Hsb to Rgbw
     RgbwColor rgbwTargetColor = targetColor;
+    // create white channel
     rgbwTargetColor.W = MIN( rgbwTargetColor.R, MIN(rgbwTargetColor.G, rgbwTargetColor.B));
     rgbwTargetColor.R = rgbwTargetColor.R - rgbwTargetColor.W; 
     rgbwTargetColor.G = rgbwTargetColor.G - rgbwTargetColor.W; 
     rgbwTargetColor.B = rgbwTargetColor.B - rgbwTargetColor.W; 
 
+    // can gamma correct using Rgbw compatible NeoGamma
     NeoGamma<NeoGammaTableMethod> colorGamma;
     rgbwTargetColor = colorGamma.Correct(rgbwTargetColor);
+
+    // use pixel color of pixel(0) as the start color to transition from
     RgbwColor originalColor = strip.GetPixelColor(0);
-    AnimEaseFunction easing =  NeoEase::Linear;
+
     AnimUpdateCallback animUpdate = [=](const AnimationParam& param)
     {
-        float progress = easing(param.progress);
         float step_progress;
 
         uint8_t NumSteps = stairs.getCountOfRings();
 
+        // use 'direction' to start fade from top or bottom
         for (uint8_t j = 0; j < NumSteps; j++) {
             if (direction > 0) {
-                step_progress = fmin(1.0f,fmax(0.0f,( 2.0f*progress - 1.0f*j/(NumSteps-1.0f))));
+                step_progress = fmin(1.0f,fmax(0.0f,( 2.0f*param.progress - 1.0f*j/(NumSteps-1.0f))));
             } else if (direction < 0) {
-                step_progress = fmin(1.0f,fmax(0.0f,( 2.0f*progress - (1.0f*NumSteps-1.0f-j)/(NumSteps-1.0f))));
+                step_progress = fmin(1.0f,fmax(0.0f,( 2.0f*param.progress - (1.0f*NumSteps-1.0f-j)/(NumSteps-1.0f))));
             } else {
-                step_progress = progress;
+                step_progress = param.progress;
             }
 
             RgbwColor updatedColor = RgbwColor::LinearBlend(originalColor, rgbwTargetColor, 
@@ -64,50 +74,125 @@ void FadeAnimationSet(HsbColor targetColor, int8_t direction)
             );
 
             uint16_t StepWidth = stairs.getPixelCountAtRing(j);
-
             for (uint16_t i = 0; i < StepWidth; i++) {
                 strip.SetPixelColor(stairs.Map(j, i), updatedColor);
             }
         }
 
+        // once fade is complete, don't restart
         if (param.state == AnimationState_Completed) {
             animations.StopAnimation(param.index);
         }
     };
 
-    animations.StartAnimation(0, 100, animUpdate);
+    animations.StartAnimation(0, direction != 0 ? 300 : 100, animUpdate);
+
+}
+// ************************************************************************
+
+
+// Stores NUM_COLOR_CYCLE colors and cycle up the stairs
+void ColorCycleAnimationSet(float hue, float saturation)
+{
+    // static variables maintain values between function calls
+    static HsbColor selectedColors[NUM_COLOR_CYCLE];
+    static uint8_t next_index = 0;
+
+    if (next_index == NUM_COLOR_CYCLE) {
+        next_index = 0;
+    }
+ 
+    // select target brightness. gamma corrected 
+    float brightness = atomic_brightness/100.0f;
+    brightness = pow(brightness,2.2);
+
+    selectedColors[next_index] = HsbColor(hue, saturation, brightness);
+    next_index++;
+
+    // spend more time at start/end (to see the color), rather than during the linear blend
+    AnimEaseFunction easing =  NeoEase::ExponentialInOut;
+
+    uint8_t NumSteps = stairs.getCountOfRings();
+    for (uint8_t j = 0; j < NumSteps; j++) {
+
+        AnimUpdateCallback animUpdate = [=](const AnimationParam& param)
+        {
+            uint8_t this_color = 0;
+            uint8_t i;
+            // divide total progress up by the number of colors to display
+            for (i = 0 ; i < NUM_COLOR_CYCLE ; i++) {
+                if (param.progress <= (float)(i+1)/(float)NUM_COLOR_CYCLE) {
+                    this_color = i;
+                    break;
+                }    
+            }
+            // then offset for each step
+            this_color += j % NUM_COLOR_CYCLE;
+            if (this_color >= NUM_COLOR_CYCLE) {
+                this_color -= NUM_COLOR_CYCLE;
+            }
+            // find out the next color to blend to
+            uint8_t next_color = this_color + 1;
+            if (next_color >= NUM_COLOR_CYCLE) {
+                next_color -= NUM_COLOR_CYCLE;
+            }
+
+            // stretch the overall progress to 0.0 -> 1.0 for use in linear blend
+            float progress = easing(param.progress * NUM_COLOR_CYCLE - i);
+
+            // update brightness from global
+            float brightness = atomic_brightness/100.0f;
+            brightness = pow(brightness,2.2);
+            for (uint8_t i = 0; i < NUM_COLOR_CYCLE; i++) {
+                selectedColors[i].B = brightness;
+            }
+
+            // LinearBlend can work with hsb color objects
+            RgbwColor color = RgbwColor::LinearBlend(selectedColors[this_color], selectedColors[next_color], progress);
+
+            uint16_t StepWidth = stairs.getPixelCountAtRing(j);
+            for (uint16_t i = 0; i < StepWidth; i++) {
+                strip.SetPixelColor(stairs.Map(j, i), color);
+            }
+
+            if (param.state == AnimationState_Completed) {
+                animations.RestartAnimation(j);
+            }
+        };
+
+        animations.StartAnimation(j, 200*NUM_COLOR_CYCLE, animUpdate);
+    }
 
 }
 
-
+// Color cycle up each step
 void RainbowFadeAnimationSet()
 {
-    AnimEaseFunction easing =  NeoEase::Linear;
-
     AnimUpdateCallback animUpdate = [=](const AnimationParam& param)
     {
-        float progress = easing(param.progress);
-
         uint8_t NumSteps = stairs.getCountOfRings();
-
         for (uint8_t j = 0; j < NumSteps; j++) {
-            float hue = progress + (1.0*j/NumSteps);
+            float hue = param.progress + (1.0*j/NumSteps);
             if (hue > 1) {
                 hue -= 1;
             }
 
-            HsbColor color = HsbColor(hue, 1.0f, 0.1f);
+            // select target brightness. don't let brightness go higher than global brightness
+            float brightness = atomic_brightness/100.0f;
+            // gamma corrected
+            brightness = pow(brightness,2.2);
+
+            HsbColor color = HsbColor(hue, 1.0f, brightness);
 
             uint16_t StepWidth = stairs.getPixelCountAtRing(j);
-
             for (uint16_t i = 0; i < StepWidth; i++) {
                 strip.SetPixelColor(stairs.Map(j, i), color);
             }
         }
 
+        // no need to call parent setup function RainbowFadeAnimationSet(). just restart animation
         if (param.state == AnimationState_Completed) {
-//            animations.RestartAnimation(param.index);
-            RainbowFadeAnimationSet();
+            animations.RestartAnimation(param.index);
         }
     };
 
@@ -115,22 +200,27 @@ void RainbowFadeAnimationSet()
 
 }
 
-
-void FlickerAnimationSet(HsbColor pickedColor)
+// User selected color. Brightness fades in/out
+void FlickerAnimationSet(float hue, float saturation)
 {
     // Every pixel is a standalone animation
     for (uint16_t pixel = 0; pixel < PixelCount; pixel++)
     {
-        // We need the current brightness of the pixel.
-        RgbwColor originalColorRgbw = strip.GetPixelColor(pixel);
-        HsbColor originalColor = HsbColor(RgbColor(originalColorRgbw.R, originalColorRgbw.G, originalColorRgbw.B));
-        originalColor = HsbColor(pickedColor.H, pickedColor.S, originalColor.B);
+        // we need the current brightness of the pixel at the start of the animation
+        RgbwColor startColorRgbw = strip.GetPixelColor(pixel);
 
-        // don't let brightness go higher than picked color
-        float brightness = fmin( pickedColor.B, (1.0*esp_random()/UINT32_MAX));
+        // we need hsb color to set start color, so use the retrieved rgbw pixel and convert to hsb
+        HsbColor startColor = HsbColor(RgbColor(startColorRgbw.R, startColorRgbw.G, startColorRgbw.B));
+        // set the color to chosen hue/saturation, and the current pixel brightness 'originalColor.B'
+        startColor = HsbColor(hue, saturation, startColor.B);
+
+        // select target brightness. don't let brightness go higher than global brightness
+        float brightness = atomic_brightness/100.0f;
+        brightness = fmin(brightness, (1.0*esp_random()/UINT32_MAX));
+        // gamma corrected
         brightness = pow(brightness,2.2);
 
-        HsbColor targetColor = HsbColor(originalColor.H, originalColor.S, brightness);
+        HsbColor targetColor = HsbColor(startColor.H, startColor.S, brightness);
 
         AnimEaseFunction easing;
 
@@ -143,16 +233,16 @@ void FlickerAnimationSet(HsbColor pickedColor)
             easing = NeoEase::CubicOut;
             break;
         case 2:
-            easing = NeoEase::QuadraticInOut;
+            easing = NeoEase::QuadraticIn;
             break;
         case 3:
-            easing = NeoEase::ExponentialIn;
+            easing = NeoEase::QuadraticOut;
             break;
         case 4:
-            easing = NeoEase::SinusoidalIn;
+            easing = NeoEase::QuinticIn;
             break;
         case 5:
-            easing = NeoEase::QuarticOut;
+            easing = NeoEase::QuinticOut;
             break;
         }
 
@@ -160,11 +250,12 @@ void FlickerAnimationSet(HsbColor pickedColor)
         {
             float progress = easing(param.progress);
 
-            RgbwColor updatedColor = RgbwColor::LinearBlend(originalColor, targetColor, progress);
+            RgbwColor updatedColor = RgbwColor::LinearBlend(startColor, targetColor, progress);
             strip.SetPixelColor(pixel, updatedColor);
 
+            // once ALL animations have completed, run it all again
             if (!animations.IsAnimating()) {
-                FlickerAnimationSet(pickedColor);
+                FlickerAnimationSet(hue, saturation);
             }
         };
 
@@ -172,22 +263,24 @@ void FlickerAnimationSet(HsbColor pickedColor)
     }
 }
 
-
-void GlitterAnimationSet(float max_brightness)
+// Randomly selected color. Brightness fades in/out
+void GlitterAnimationSet()
 {
     // Every pixel is a standalone animation
     for (uint16_t pixel = 0; pixel < PixelCount; pixel++)
     {
         // each animation starts with the color that was present
-        RgbwColor originalColor = strip.GetPixelColor(pixel);
-        // and ends with a random color
-        float hue = (float)(1.0*esp_random()/UINT32_MAX);
+        RgbwColor startColorRgbw = strip.GetPixelColor(pixel);
 
-        float brightness = fmin(max_brightness, (1.0*esp_random()/UINT32_MAX));
+        // select target brightness. don't let brightness go higher than global brightness
+        float brightness = atomic_brightness/100.0f;
+        brightness = fmin(brightness, (1.0*esp_random()/UINT32_MAX));
         brightness = pow(brightness,2.2);
 
-        HsbColor targetColorHsb = HsbColor(hue, 1.0, brightness);
-        RgbwColor targetColor = RgbwColor(targetColorHsb);
+        // and a random color
+        float hue = (float)(1.0*esp_random()/UINT32_MAX);
+
+        HsbColor targetColor = HsbColor(hue, 1.0, brightness);
 
         // with the random ease function
         AnimEaseFunction easing;
@@ -201,16 +294,16 @@ void GlitterAnimationSet(float max_brightness)
             easing = NeoEase::CubicOut;
             break;
         case 2:
-            easing = NeoEase::QuadraticInOut;
+            easing = NeoEase::QuadraticIn;
             break;
         case 3:
-            easing = NeoEase::ExponentialIn;
+            easing = NeoEase::QuadraticOut;
             break;
         case 4:
-            easing = NeoEase::SinusoidalIn;
+            easing = NeoEase::QuinticIn;
             break;
         case 5:
-            easing = NeoEase::QuarticOut;
+            easing = NeoEase::QuinticOut;
             break;
         }
 
@@ -221,30 +314,27 @@ void GlitterAnimationSet(float max_brightness)
         {
             float progress = easing(param.progress);
 
-            RgbwColor updatedColor = RgbwColor::LinearBlend(originalColor, targetColor, progress);
+            // LinearBlend can accept Rgbw and Hsb color objects
+            RgbwColor updatedColor = RgbwColor::LinearBlend(startColorRgbw, targetColor, progress);
             strip.SetPixelColor(pixel, updatedColor);
 
-            // luckily, this will return false whilst executing the final animation
+            // once ALL animations have completed, run it all again
             if (!animations.IsAnimating()) {
-                GlitterAnimationSet(max_brightness);
+                GlitterAnimationSet();
             }
         };
 
-        // now use the animation properties we just calculated and start the animation
-        // which will continue to run and call the update function until it completes
         animations.StartAnimation(pixel, 200, animUpdate);
 
     }
 }
 
 
-void CylonAnimationSet()
+void CylonAnimationSet() 
 {
-    // static variables are only created the first time a function is called. 
-    // they retain values between calls. they act like global variables.
     static uint16_t s_last_pixel;
     static int8_t s_direction;
-    static RgbwColor color;
+    static float hue;
 
     s_last_pixel = 0;
     s_direction = 1;
@@ -252,25 +342,27 @@ void CylonAnimationSet()
     AnimUpdateCallback animUpdate = [=](const AnimationParam& param)
     {
         if (param.state == AnimationState_Started) {
-            color = RgbwColor(esp_random()%255, esp_random()%255, esp_random()%255, 0);
+            hue = (float)(1.0*esp_random()/UINT32_MAX);
         }
-        NeoGamma<NeoGammaTableMethod> colorGamma;
+
+        float brightness = atomic_brightness/100.0f;
+        brightness = pow(brightness,2.2);
+        brightness = fmax(0.03, brightness);
+
+        HsbColor hsbColor = HsbColor(hue, 1.0, brightness); 
 
         AnimEaseFunction easing = NeoEase::QuarticInOut;
-        // progress will start at 0.0 and end at 1.0. we convert to the curve we want
         float progress = easing(param.progress);
 
         // darken all pixels
-        RgbwColor pixel_color;
-        for (uint16_t i = 0; i < PixelCount; i++)
-        {
-            pixel_color = strip.GetPixelColor(i);
-            pixel_color.Darken(20);
+        int darken_by = 50 * hsbColor.B + 1;
+        for (uint16_t i = 0; i < PixelCount; i++) {
+            RgbwColor pixel_color = strip.GetPixelColor(i);
+            pixel_color.Darken(darken_by);
             strip.SetPixelColor(i, pixel_color);
         }
 
         // use the curved progress to calculate the pixel to effect.
-        // include ALL stairs
         uint16_t next_pixel;
         if (s_direction > 0) {
             next_pixel = progress * PixelCount;
@@ -288,7 +380,7 @@ void CylonAnimationSet()
         uint8_t i = 0;
         do {
             uint16_t i_pixel = next_pixel - i * s_direction;
-            strip.SetPixelColor(i_pixel, colorGamma.Correct(color));
+            strip.SetPixelColor(i_pixel, hsbColor);
             i++;
         } while ( i < pixel_diff);
 
@@ -299,34 +391,38 @@ void CylonAnimationSet()
 
             // time is centiseconds
             uint16_t time = 1000 + esp_random()%1000;
-
             animations.AnimationDuration(time);
             animations.RestartAnimation(param.index);
         }
     };
 
-    animations.StartAnimation(0, 1000, animUpdate);
+    // start animation for the first time
+    uint16_t time = 1000 + esp_random()%1000;
+    animations.StartAnimation(0, time, animUpdate);
 }
 
-
+// Each step has an animated back and forth 'Cylon' transition
 void StepCylonAnimationSet()
 {
     uint8_t NumSteps = stairs.getCountOfRings();
     for (uint8_t j = 0; j < NumSteps; j++) {
         
-        uint16_t time = 400 + esp_random()%600;
-
         AnimUpdateCallback animUpdate = [=](const AnimationParam& param)
         {
-            RgbwColor color;
-            int16_t next_pixel, last_pixel;
-            int8_t direction;
+             if (param.state == AnimationState_Started) {
+                float hue = (float)(1.0*esp_random()/UINT32_MAX);
+
+                float brightness = atomic_brightness/100.0f;
+                brightness = pow(brightness, 2.2);
+                // do not go lower than this. it will cause CalculateBrightness to return 0
+                brightness = fmax(0.03, brightness);
+
+                HsbColor hsbColor = HsbColor(hue, 1.0, brightness);                
+                strip.SetPixelColor(stairs.Map(j, 0), hsbColor);
+           }
+
             float progress;
-
-            if (param.state == AnimationState_Started) {
-                HsbColor hsbColor = HsbColor(1.0f*esp_random()/UINT32_MAX, 1.0, ( 0.2f + (1.0f*esp_random()/UINT32_MAX)/2.0f ));                strip.SetPixelColor(stairs.Map(j, 0), hsbColor);
-            }
-
+            int8_t direction;
             // half is one way, the other half is the other way
             if (param.progress > 0.50) {
                 direction = -1;
@@ -340,6 +436,7 @@ void StepCylonAnimationSet()
 
             uint16_t StepWidth = stairs.getPixelCountAtRing(j);
 
+            int16_t next_pixel, last_pixel;
             // use the curved progress to calculate next pixel. pixels are 0 -> StepWidth-1
             if (direction > 0) {
                 next_pixel = progress * StepWidth;
@@ -351,8 +448,10 @@ void StepCylonAnimationSet()
                 next_pixel -= 1;
             }
 
+            RgbwColor color;
             // not storing s_last_pixel, so iterate backwards and find the leading edge of the trail
             for (last_pixel = next_pixel; ; last_pixel -= direction) {
+                // GetPixelColor returns a Rgbw color object
                 uint8_t this_brightness = strip.GetPixelColor(stairs.Map(j, last_pixel)).CalculateBrightness();
                 uint8_t prev_brightness = strip.GetPixelColor(stairs.Map(j, last_pixel + direction)).CalculateBrightness();
 
@@ -366,11 +465,14 @@ void StepCylonAnimationSet()
                 } 
             }
 
+            // determine brightness by converting to Hsb
+            HsbColor colorHsb = HsbColor(RgbColor(color.R, color.G, color.B));
+            int darken_by = 40 * colorHsb.B + 1;
             // darken the pixels on the strip
             for (uint16_t i = 0; i < StepWidth; i++)
             {
                 RgbwColor pixel_color = strip.GetPixelColor(stairs.Map(j, i));
-                pixel_color.Darken(20);
+                pixel_color.Darken(darken_by);
                 strip.SetPixelColor(stairs.Map(j, i), pixel_color);
             }
 
@@ -386,23 +488,23 @@ void StepCylonAnimationSet()
 
             if (param.state == AnimationState_Completed) {
                 uint16_t time = 400 + esp_random()%600;
-                
                 animations.ChangeAnimationDuration(j, time);
                 animations.RestartAnimation(j);
             }
         };
 
+        // start the animation for the first time
+        uint16_t time = 400 + esp_random()%600;
         animations.StartAnimation(j, time, animUpdate);
     }
 }
-
 
 // similar to Cylon, but go left-right-left
 void SnakeAnimationSet()
 {
     static uint16_t s_last_pixel;
     static int8_t s_direction;
-    static RgbwColor color;
+    static float hue;
 
     s_last_pixel = 0;
     s_direction = 1;
@@ -410,21 +512,23 @@ void SnakeAnimationSet()
     AnimUpdateCallback animUpdate = [=](const AnimationParam& param)
     {
         if (param.state == AnimationState_Started) {
-            color = RgbwColor(esp_random()%255, esp_random()%255, esp_random()%255, 0);
+            hue = (float)(1.0*esp_random()/UINT32_MAX);
         }
 
-        NeoGamma<NeoGammaTableMethod> colorGamma;
+        float brightness = atomic_brightness/100.0f;
+        brightness = pow(brightness,2.2);
+        brightness = fmax(0.03, brightness);
 
-        AnimEaseFunction easing = NeoEase::QuarticInOut;
-        // progress will start at 0.0 and end at 1.0. we convert to the curve we want
+        HsbColor hsbColor = HsbColor(hue, 1.0, brightness); 
+        
+        AnimEaseFunction easing = NeoEase::QuadraticInOut;
         float progress = easing(param.progress);
 
         // darken all pixels
-        RgbwColor pixel_color;
-        for (uint16_t i = 0; i < PixelCount; i++)
-        {
-            pixel_color = strip.GetPixelColor(i);
-            pixel_color.Darken(20);
+        int darken_by = 50 * hsbColor.B + 1;
+        for (uint16_t i = 0; i < PixelCount; i++) {
+            RgbwColor pixel_color = strip.GetPixelColor(i);
+            pixel_color.Darken(darken_by);
             strip.SetPixelColor(i, pixel_color);
         }
 
@@ -463,7 +567,7 @@ void SnakeAnimationSet()
                 pixel_num = stairs.getPixelCountAtRing(step_num) - pixel_num -1;
             }
 
-            strip.SetPixelColor(stairs.Map(step_num, pixel_num), colorGamma.Correct(color));
+            strip.SetPixelColor(stairs.Map(step_num, pixel_num), hsbColor);
 
             i++;
         } while ( i < pixel_diff);
@@ -474,17 +578,18 @@ void SnakeAnimationSet()
             s_direction *= -1;
 
             uint16_t time = 1000 + esp_random()%1000;
-
             animations.AnimationDuration(time);
             animations.RestartAnimation(param.index);
         }
     };
 
-    animations.StartAnimation(0, 1000, animUpdate);
+    uint16_t time = 1000 + esp_random()%1000;
+    animations.StartAnimation(0, time, animUpdate);
 }
 
 
-void FireworksAnimationSetHsb() {
+void FireworksAnimationSetHsb() 
+{
     // Set random pixels on (exclude bottom and top step)
 
     for (uint16_t indexPixel = stairs.getPixelCountAtRing(0); indexPixel < PixelCount - stairs.getPixelCountAtRing(stairs.getCountOfRings()-1); indexPixel++)  {
@@ -603,9 +708,6 @@ void FireworksAnimationSetHsb() {
 
 
 
-
-
-
 void animation_task(void * param)
 {
     strip.Begin();   
@@ -623,22 +725,23 @@ void animation_task(void * param)
 void animation_select_task(void * param)
 {
     s_led_message_queue = xQueueCreate( 10, sizeof(led_strip_t));
-
     led_strip_t led_strip;
 
     while(1) {
         if (xQueueReceive(s_led_message_queue, (void *) &led_strip, portMAX_DELAY) == pdTRUE) {
-             if (led_strip.animate) {
+            if (led_strip.animate) {
                 animations.StopAll();
                 strip.ClearTo(HsbColor(0.0, 0.0, 0.0));
                 strip.Show();
 
+                atomic_brightness = led_strip.brightness;
+                
                 switch(led_strip.animation_id) {
                     case 1:
                         CylonAnimationSet();
                         break;
                     case 2:
-                        GlitterAnimationSet(led_strip.brightness);
+                        GlitterAnimationSet();
                         break;
                     case 3:
                         StepCylonAnimationSet();
@@ -650,18 +753,35 @@ void animation_select_task(void * param)
                         FireworksAnimationSetHsb();
                         break;
                     case 6:
-                        FlickerAnimationSet(HsbColor(led_strip.hue, led_strip.saturation, led_strip.brightness));
+                        FlickerAnimationSet(led_strip.hue, led_strip.saturation);
                         break;  
                     case 7:
                         SnakeAnimationSet();
-                        break;              
+                        break;  
+                    case 8:
+                        ColorCycleAnimationSet(led_strip.hue, led_strip.saturation);
+                        break;         
                 }
-            } else {
+            } 
+            
+            else {
                 if (animations.IsAnimating()) {
                     animations.StopAll();
                 }
-                // use direction when a sensor detects person at top or bottom. How?
-                FadeAnimationSet(HsbColor(led_strip.hue, led_strip.saturation, led_strip.brightness), 1);
+                // look at custom/switch id and determine direction for fade
+                int8_t direction = 0;
+                switch (led_strip.custom_id) {
+                    case 0:
+                        direction = 0;
+                        break;
+                    case 1:
+                        direction = 1;
+                        break;
+                    case 2:
+                        direction = -1;
+                        break;
+                }
+                FadeAnimationSet(HsbColor(led_strip.hue, led_strip.saturation, led_strip.brightness/100.0f), direction);
             }
         }
     }
@@ -675,4 +795,8 @@ void start_animation_task() {
 
 void set_strip(led_strip_t led_strip) {
     xQueueSendToBack(s_led_message_queue, (void *) &led_strip, (TickType_t) 0);
+}
+
+void set_brightness(int brightness) {
+    atomic_brightness = brightness;
 }

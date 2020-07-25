@@ -3,6 +3,7 @@
 #include "freertos/event_groups.h"              // For EventGroupHandle_t
 #include "driver/gpio.h"
 #include <sys/param.h>                          // MIN MAX
+#include <string.h>                             // strcmp
 
 #include "esp_event.h"
 
@@ -59,44 +60,94 @@ void status_led_identify(homekit_value_t _value) {
     led_status_signal(led_status, &identify);
 }
 
-void state_change_on_callback(homekit_characteristic_t *_ch, homekit_value_t value, void *context) {
-    homekit_service_t *tv_service = homekit_service_by_type(_ch->service->accessory, HOMEKIT_SERVICE_TELEVISION);
-    homekit_service_t *light_service = homekit_service_by_type(_ch->service->accessory, HOMEKIT_SERVICE_LIGHTBULB);
 
-    homekit_characteristic_t *hue        = homekit_service_characteristic_by_type(light_service, HOMEKIT_CHARACTERISTIC_HUE);
-    homekit_characteristic_t *sat        = homekit_service_characteristic_by_type(light_service, HOMEKIT_CHARACTERISTIC_SATURATION);
-    homekit_characteristic_t *brightness = homekit_service_characteristic_by_type(light_service, HOMEKIT_CHARACTERISTIC_BRIGHTNESS);
-    homekit_characteristic_t *on         = homekit_service_characteristic_by_type(light_service, HOMEKIT_CHARACTERISTIC_ON);
-    homekit_characteristic_t *direction  = homekit_service_characteristic_by_type(light_service, "02B77067-DA5D-493C-829D-F6C5DCFE5C28");
+void state_change_on_callback(homekit_characteristic_t *_ch, homekit_value_t value, void *context) {
+    // static variables retain value between calls (like global)
+    static bool last_on_state = false;
+
+    ESP_LOGI(TAG, "%s", _ch->description);
+
+    homekit_service_t *light_service     = homekit_service_by_type(_ch->service->accessory, HOMEKIT_SERVICE_LIGHTBULB);
+    homekit_service_t *tv_service        = homekit_service_by_type(_ch->service->accessory, HOMEKIT_SERVICE_TELEVISION);
 
     homekit_characteristic_t *active     = homekit_service_characteristic_by_type(tv_service, HOMEKIT_CHARACTERISTIC_ACTIVE);
     homekit_characteristic_t *active_id  = homekit_service_characteristic_by_type(tv_service, HOMEKIT_CHARACTERISTIC_ACTIVE_IDENTIFIER);
 
-    led_strip_t led_strip;
-    if (active->value.bool_value && on->value.bool_value) {
-        led_strip.hue          = hue->value.float_value/360.0f;
-        led_strip.saturation   = sat->value.float_value/100.0f;
-        led_strip.brightness   = brightness->value.int_value/100.0f;
-        led_strip.animate      = true;
-        led_strip.animation_id = active_id->value.int_value;
-    } else if (!on->value.bool_value) {
-        led_strip.hue          = 0.0f;
-        led_strip.saturation   = 0.0f;
-        led_strip.brightness   = 0.0f;
-        led_strip.animate      = false;
-        led_strip.animation_id = 0;
-    } else {
-        led_strip.hue          = hue->value.float_value/360.0f;
-        led_strip.saturation   = sat->value.float_value/100.0f;
-        led_strip.brightness   = brightness->value.int_value/100.0f;
-        led_strip.animate      = false;
-        led_strip.animation_id = 0;
+    homekit_characteristic_t *brightness = homekit_service_characteristic_by_type(light_service, HOMEKIT_CHARACTERISTIC_BRIGHTNESS);
+    homekit_characteristic_t *hue        = homekit_service_characteristic_by_type(light_service, HOMEKIT_CHARACTERISTIC_HUE);
+    homekit_characteristic_t *sat        = homekit_service_characteristic_by_type(light_service, HOMEKIT_CHARACTERISTIC_SATURATION);
+    homekit_characteristic_t *on         = homekit_service_characteristic_by_type(light_service, HOMEKIT_CHARACTERISTIC_ON);
+    homekit_characteristic_t *custom_id  = homekit_service_characteristic_by_type(light_service, "02B77067-DA5D-493C-829D-F6C5DCFE5C28");
+
+
+    // when color changes, hue and saturation events are sent. 
+    //   we only need the latter one (which is hue)
+    if (strcmp(_ch->type, HOMEKIT_CHARACTERISTIC_SATURATION) == 0) {
+        ESP_LOGW(TAG, "SATURATION characrteristic. no action.");
+        return;
+    }
+    // BRIGHTNESS always has ON preceeding it. ignore, unless there is a change of state
+    else if (strcmp(_ch->type, HOMEKIT_CHARACTERISTIC_ON) == 0 && 
+        last_on_state == on->value.bool_value) {
+            ESP_LOGW(TAG, "ON bool has not changed. no action.");
+        return;
+    } 
+    else if (strcmp(_ch->type, HOMEKIT_CHARACTERISTIC_ON) == 0) {
+        ESP_LOGW(TAG, "ON bool has changed. update and continue.");
+        last_on_state = on->value.bool_value;
     }
 
-            ESP_LOGI(TAG, "direction %d", direction->value.int_value);
 
-    set_strip(led_strip);
+    led_strip_t led_strip;
+    if (!on->value.bool_value) {
+        led_strip.hue               = 0.0f;
+        led_strip.saturation        = 0.0f;
+        led_strip.brightness        = 0;
+        led_strip.animate           = false;
+        led_strip.custom_id         = custom_id->value.int_value; 
+
+        // turning off in Home app sends ON and BRIGHTNESS
+        // turning off remotely sends only ON
+        if (strcmp(_ch->type, HOMEKIT_CHARACTERISTIC_ON) == 0) {
+            ESP_LOGW(TAG, "set_strip off if[#1]");
+            set_strip(led_strip);
+        }  
+    } 
+    else if (active->value.bool_value) {
+        led_strip.hue               = hue->value.float_value/360.0f;
+        led_strip.saturation        = sat->value.float_value/100.0f;
+        led_strip.brightness        = brightness->value.int_value;
+        led_strip.animate           = true;
+        led_strip.animation_id      = active_id->value.int_value;
+        led_strip.custom_id         = custom_id->value.int_value;  
+
+        if (strcmp(_ch->type, HOMEKIT_CHARACTERISTIC_BRIGHTNESS) == 0) {
+            ESP_LOGW(TAG, "set_brightness animate active elseif[#2]");
+            set_brightness(brightness->value.int_value); 
+        } 
+        else {
+            ESP_LOGW(TAG, "set_strip animate active elseif[#2]");
+            set_strip(led_strip);
+        }
+             
+    } 
+    else {
+        led_strip.hue               = hue->value.float_value/360.0f;
+        led_strip.saturation        = sat->value.float_value/100.0f;
+        led_strip.brightness        = brightness->value.int_value;
+        led_strip.animate           = false;
+        led_strip.animation_id      = 0;
+        led_strip.custom_id         = custom_id->value.int_value; 
+
+        // sent on both ON, BRIGHTNESS and HUE
+        ESP_LOGW(TAG, "set_strip on elseif[#3]");
+        set_strip(led_strip);
+    }
+
+    // reset remote custom id back to 0 (local).
+    custom_id->value = HOMEKIT_INT(0);
 }
+
 
 
 void name_change_callback(homekit_characteristic_t *_ch, homekit_value_t value, void *context) {
@@ -211,7 +262,7 @@ static void main_event_handler(void* arg, esp_event_base_t event_base,
             else if (event_id == 4) {
                 ESP_LOGW(TAG, "HEAP %d",  heap_caps_get_free_size(MALLOC_CAP_8BIT));
 
-                char buffer[400];
+                char buffer[600];
                 vTaskList(buffer);
                 ESP_LOGI(TAG, "\n%s", buffer);
             } 
@@ -365,10 +416,10 @@ void init_accessory() {
             NEW_HOMEKIT_CHARACTERISTIC(
                 CUSTOM, 0,
                 .type = "02B77067-DA5D-493C-829D-F6C5DCFE5C28",
-                .description = "Fade Direction",
-                .format = homekit_format_uint8,
+                .description = "Remote Switch ID",
+                .format = homekit_format_int,
                 .min_value = (float[]) {0},
-                .max_value = (float[]) {2},
+                .max_value = (float[]) {6},
                 .permissions = homekit_permissions_paired_read
                              | homekit_permissions_paired_write,
             ),
@@ -401,10 +452,11 @@ void app_main(void)
     esp_log_level_set("httpd", ESP_LOG_INFO); 
     esp_log_level_set("httpd_uri", ESP_LOG_INFO);    
     esp_log_level_set("httpd_txrx", ESP_LOG_INFO);     
-//    esp_log_level_set("httpd_sess", ESP_LOG_INFO);
+    esp_log_level_set("httpd_sess", ESP_LOG_INFO);
     esp_log_level_set("httpd_parse", ESP_LOG_INFO);  
     esp_log_level_set("vfs", ESP_LOG_INFO);     
-    esp_log_level_set("esp_timer", ESP_LOG_INFO);     
+    esp_log_level_set("esp_timer", ESP_LOG_INFO);  
+    esp_log_level_set("esp_netif_lwip", ESP_LOG_INFO);     
  
     // Initialize NVS. 
     err = nvs_flash_init();
