@@ -24,6 +24,12 @@ static TimerHandle_t g_retry_connect_timer = NULL;
 static TimerHandle_t g_stop_delay_timer = NULL;
 static SemaphoreHandle_t g_wifi_mutex = NULL;
 
+esp_event_handler_instance_t wifi_ap_staconnected;
+esp_event_handler_instance_t wifi_ap_stadisconnected;
+esp_event_handler_instance_t wifi_sta_start;
+esp_event_handler_instance_t wifi_sta_disconnected;
+esp_event_handler_instance_t ip_got_ip;
+
 void start_ap_prov();
 void stop_ap_prov();
 
@@ -164,25 +170,16 @@ void stop_ap_prov() {
     ESP_LOGI(TAG, "Stopped softAP and HTTPD Service");
 }
 
-void wifi_init() {
+void my_wifi_init() {
     vSemaphoreCreateBinary(g_wifi_mutex);
-
-    // Mandatory Wi-Fi initialisation code
-    #ifdef CONFIG_IDF_TARGET_ESP32
-        ESP_ERROR_CHECK(esp_netif_init());             // previously tcpip_adapter_init()
-        esp_netif_create_default_wifi_sta();
-        esp_netif_create_default_wifi_ap();
-    #elif CONFIG_IDF_TARGET_ESP8266
-        tcpip_adapter_init();
-    #endif
 
     // esp_event_handler_register is being deprecated
     #ifdef CONFIG_IDF_TARGET_ESP32
-        ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_AP_STACONNECTED, wifi_event_handler, NULL, NULL));
-        ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_AP_STADISCONNECTED, wifi_event_handler, NULL, NULL));
-        ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_STA_START, wifi_event_handler, NULL, NULL));
-        ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, wifi_event_handler, NULL, NULL));
-        ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL, NULL));
+        ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_AP_STACONNECTED, wifi_event_handler, NULL, &wifi_ap_staconnected));
+        ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_AP_STADISCONNECTED, wifi_event_handler, NULL, &wifi_ap_stadisconnected));
+        ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_STA_START, wifi_event_handler, NULL, &wifi_sta_start));
+        ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, wifi_event_handler, NULL, &wifi_sta_disconnected));
+        ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL, &ip_got_ip));
     #elif CONFIG_IDF_TARGET_ESP8266
         ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_STACONNECTED, wifi_event_handler, NULL));
         ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_STADISCONNECTED, wifi_event_handler, NULL));
@@ -207,5 +204,50 @@ void wifi_init() {
     g_stop_delay_timer = xTimerCreate(
         "delay_stop_ap", pdMS_TO_TICKS(STOP_AP_DELAY), pdFALSE, NULL, stop_delay_callback
     );
+
+}
+
+esp_err_t my_wifi_deinit() {
+
+    esp_err_t err;
+
+    if (g_retry_connect_timer) {
+        xTimerDelete(g_retry_connect_timer, 0);
+    }
+    if (g_stop_delay_timer) {
+        xTimerDelete(g_stop_delay_timer, 0);
+    }
+    if (g_wifi_mutex) {
+        vSemaphoreDelete(g_wifi_mutex);
+    }
+    g_retry_connect_timer = NULL;
+    g_stop_delay_timer = NULL;
+    g_wifi_mutex = NULL;
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_unregister(WIFI_EVENT, WIFI_EVENT_AP_STACONNECTED, wifi_ap_staconnected));
+    ESP_ERROR_CHECK(esp_event_handler_instance_unregister(WIFI_EVENT, WIFI_EVENT_AP_STADISCONNECTED, wifi_ap_stadisconnected));
+    ESP_ERROR_CHECK(esp_event_handler_instance_unregister(WIFI_EVENT, WIFI_EVENT_STA_START, wifi_sta_start));
+    ESP_ERROR_CHECK(esp_event_handler_instance_unregister(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, wifi_sta_disconnected));
+    ESP_ERROR_CHECK(esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, ip_got_ip));
+
+
+    err = esp_wifi_disconnect();
+    if (err == ESP_ERR_WIFI_NOT_INIT) {
+        ESP_LOGI(TAG, "cannot disconnect. wifi deinit"); 
+        return err;
+    }
+    err = esp_wifi_stop();
+    if (err == ESP_ERR_WIFI_NOT_INIT) {
+        ESP_LOGI(TAG, "cannot stop. wifi deinit"); 
+        return err;
+    }
+    err = esp_wifi_deinit();
+    if (err == ESP_ERR_WIFI_NOT_INIT) {
+        ESP_LOGI(TAG, "cannot deinit. wifi already deinit"); 
+        return err;
+    }
+
+
+    return err;
 
 }

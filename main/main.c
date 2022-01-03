@@ -5,6 +5,9 @@
 #include <sys/param.h>                          // MIN MAX
 #include <string.h>                             // strcmp
 
+#include "esp_ota_ops.h"
+#include "esp_image_format.h"
+
 #include "esp_event.h"
 
 #include "nvs.h"
@@ -28,8 +31,6 @@ ESP_EVENT_DEFINE_BASE(BUTTON_EVENT);            // Convert button events into es
     #include "mdns.h"                           // ESP8266 RTOS SDK mDNS needs legacy STATUS_EVENT to be sent to it
 #endif
 ESP_EVENT_DEFINE_BASE(HOMEKIT_EVENT);           // Convert esp-homekit events into esp event system      
-
-#include "lights.h"                             // common struct used for NVS read/write of lights config
 
 #include "animation.h"
 
@@ -64,6 +65,7 @@ void status_led_identify(homekit_value_t _value) {
 void state_change_on_callback(homekit_characteristic_t *_ch, homekit_value_t value, void *context) {
     // static variables retain value between calls (like global)
     static bool last_on_state = false;
+    static int last_brightness = 100;
 
     ESP_LOGI(TAG, "%s", _ch->description);
 
@@ -79,17 +81,24 @@ void state_change_on_callback(homekit_characteristic_t *_ch, homekit_value_t val
     homekit_characteristic_t *on         = homekit_service_characteristic_by_type(light_service, HOMEKIT_CHARACTERISTIC_ON);
     homekit_characteristic_t *custom_id  = homekit_service_characteristic_by_type(light_service, "02B77067-DA5D-493C-829D-F6C5DCFE5C28");
 
+    // when using Siri, 
+    //    turning ON or OFF only triggers the ON characteristic
+    //    when changing BRIGHTNESS, ON follows BRIGHTNESS
 
+    // when using the Home app, 
+    //    you must use the slider to turn on and off. Both ON followed by BRIGHTNESS characteristics trigger
+    //    when changing BRIGHTNESS, ON precedes BRIGHTNESS
+
+    
     // when color changes, hue and saturation events are sent. 
     //   we only need the latter one (which is hue)
     if (strcmp(_ch->type, HOMEKIT_CHARACTERISTIC_SATURATION) == 0) {
-        ESP_LOGW(TAG, "SATURATION characrteristic. no action.");
+        ESP_LOGW(TAG, "SATURATION characteristic. no action.");
         return;
     }
-    // BRIGHTNESS always has ON preceeding it. ignore, unless there is a change of state
-    else if (strcmp(_ch->type, HOMEKIT_CHARACTERISTIC_ON) == 0 && 
-        last_on_state == on->value.bool_value) {
-            ESP_LOGW(TAG, "ON bool has not changed. no action.");
+    // BRIGHTNESS always includes ON (before or after). ignore, unless there is a change of state, allowing the BRIGHTNESS trigger to do the work
+    else if (strcmp(_ch->type, HOMEKIT_CHARACTERISTIC_ON) == 0 && last_on_state == on->value.bool_value) {
+        ESP_LOGW(TAG, "ON bool has not changed. no action.");
         return;
     } 
     else if (strcmp(_ch->type, HOMEKIT_CHARACTERISTIC_ON) == 0) {
@@ -97,8 +106,9 @@ void state_change_on_callback(homekit_characteristic_t *_ch, homekit_value_t val
         last_on_state = on->value.bool_value;
     }
 
-
     led_strip_t led_strip;
+
+    // turn off
     if (!on->value.bool_value) {
         led_strip.hue               = 0.0f;
         led_strip.saturation        = 0.0f;
@@ -109,17 +119,40 @@ void state_change_on_callback(homekit_characteristic_t *_ch, homekit_value_t val
         // turning off in Home app sends ON and BRIGHTNESS
         // turning off remotely sends only ON
         if (strcmp(_ch->type, HOMEKIT_CHARACTERISTIC_ON) == 0) {
-            ESP_LOGW(TAG, "set_strip off if[#1]");
+            ESP_LOGW(TAG, "set_strip off and save last brightness %d if[#1]", brightness->value.int_value);
+            last_brightness = brightness->value.int_value;                 // saved for the above case when turning off light from Home app
             set_strip(led_strip);
         }  
+        else {
+            // when you use the Home app to turn off the light, the BRIGHTNESS slider is pulled to 0%. When you
+            //   subsequently use Siri to turn it back on, the BRIGHTNESS stays at 0%. We need to restore the 
+            //   BRIGHTNESS value it was before being pulled to 0%.
+            if (brightness->value.int_value != last_brightness) {
+                ESP_LOGW(TAG, "restore last_brightness %d to characteristic if[#1]", last_brightness);
+                brightness->value.int_value = last_brightness;
+                homekit_characteristic_notify(brightness, brightness->value);       // notify/update the Home app
+            }
+            else {
+                ESP_LOGW(TAG, "ignore. this is caused by the homekit_characteristic_notify above");
+            }
+            return;
+        }
     } 
+    // turn on animate
     else if (active->value.bool_value) {
         led_strip.hue               = hue->value.float_value/360.0f;
         led_strip.saturation        = sat->value.float_value/100.0f;
         led_strip.brightness        = brightness->value.int_value;
         led_strip.animate           = true;
         led_strip.animation_id      = active_id->value.int_value;
-        led_strip.custom_id         = custom_id->value.int_value;  
+
+        // if a remote button is the cause, then turn off animations
+        if (custom_id->value.int_value != 0) {
+            active->value = HOMEKIT_UINT8(false);
+            // this event will fire again; this time turning on the lights normally
+            homekit_characteristic_notify(active, active->value);
+            return;
+        }
 
         if (strcmp(_ch->type, HOMEKIT_CHARACTERISTIC_BRIGHTNESS) == 0) {
             ESP_LOGW(TAG, "set_brightness animate active elseif[#2]");
@@ -131,6 +164,7 @@ void state_change_on_callback(homekit_characteristic_t *_ch, homekit_value_t val
         }
              
     } 
+    // turn light on, modify brightness/hue/saturation or turn off animate
     else {
         led_strip.hue               = hue->value.float_value/360.0f;
         led_strip.saturation        = sat->value.float_value/100.0f;
@@ -228,7 +262,7 @@ static void main_event_handler(void* arg, esp_event_base_t event_base,
     } else if (event_base == BUTTON_EVENT) {
 
         if (event_id == BUTTON_EVENT_UP) {
-
+            
         }
         else if (event_id == BUTTON_EVENT_DOWN) {
 
@@ -256,8 +290,16 @@ static void main_event_handler(void* arg, esp_event_base_t event_base,
             //homekit_service_t *service = accessory->services[service_idx];
 
             if (event_id == 1) {
-
-            } 
+                /*
+                ESP_LOGI(TAG, "wifi deinit"); 
+                esp_err_t err = my_wifi_deinit();
+            
+                if (err == ESP_ERR_WIFI_NOT_INIT) {
+                    ESP_LOGI(TAG, "wifi already deinit. init wifi"); 
+                    my_wifi_init();
+                } 
+                */
+            }
 
             else if (event_id == 4) {
                 ESP_LOGW(TAG, "HEAP %d",  heap_caps_get_free_size(MALLOC_CAP_8BIT));
@@ -483,7 +525,35 @@ void app_main(void)
 
     led_status = led_status_init(2, true);
 
-    wifi_init();
+
+    // Initialise underlying TCP/IP stack (deinit is not supported, and init should only be called once on application start)
+    #ifdef CONFIG_IDF_TARGET_ESP32
+        ESP_ERROR_CHECK(esp_netif_init());             // previously tcpip_adapter_init()
+        esp_netif_create_default_wifi_sta();
+        esp_netif_create_default_wifi_ap();
+    #elif CONFIG_IDF_TARGET_ESP8266
+        tcpip_adapter_init();
+    #endif
+
+    my_wifi_init();
+
+
+/*
+    esp_app_desc_t app_desc;
+    const esp_partition_t *ota0_partition;
+    ota0_partition = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, NULL);
+    esp_ota_get_partition_description(ota0_partition, &app_desc);
+    ESP_LOGI(TAG, "ota0 version: %s", app_desc.version);
+
+    const esp_partition_t *ota1_partition;
+    ota1_partition = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_1, NULL);
+    esp_ota_get_partition_description(ota1_partition, &app_desc);
+    ESP_LOGI(TAG, "ota1 version: %s", app_desc.version);
+
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    ESP_LOGI(TAG, "Running partition type %d subtype %d (offset 0x%08x)",
+             running->type, running->subtype, running->address);
+*/
 
     // 1. button configuration
     button_config_t button_config = {
@@ -499,5 +569,12 @@ void app_main(void)
     paired = homekit_is_paired();
 
     start_animation_task();
+
+
+    vTaskDelay(50);
+
+    // I have had my program work on a DevKit module, but fail on a TinyPico module.
+    //   App rollback ensures everything starts OK and sets the image valid. Otherwise, on the next reboot, it will rollback.
+    esp_ota_mark_app_valid_cancel_rollback();
 
 }

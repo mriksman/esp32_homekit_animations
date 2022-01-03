@@ -131,33 +131,21 @@ h3 {
 	font: 1em courier;
 }
 
-.flex_form_row {
+.matrix_container {
 	flex-grow: 1;
 	
 	display: flex;
 	flex-wrap: wrap;
-	justify-content: space-around;
-	align-items: center; 
 }
-.flex_form_cell {
-	flex-grow: 1;
+.matrix_container_item {
+	flex-basis: 33%;
+
+	display: flex;									/* also a flex parent */	
+	align-items: center;							/* vertically align items (label and input) */
+	padding-bottom: 5px;
 }
-.flex_form_cell.label {
-	width: 20%;
-}
-.flex_form_cell.number {
-	width:15%;
-}
-.flex_form_cell.checkbox {
-	width:15%;
-	padding-left:22px
-}
-.flex_form_cell.text {
-	width:80%;
-}
-input[type="text"] {
-	width:100%;
-	font: 0.9em courier;
+.flex_cell_even_split {
+	width: 50%;
 }
 input[type="number"] {
 	width:3em;
@@ -406,7 +394,7 @@ p {
 </head>
 <body>
 	<div id="app">
-		<div id="wifi" class="slider">
+		<div id="main_page" class="slider">
 			<h1>ESP HomeKit</h1>
 			<div id="wifi-status" class="slider closed">
 				<div class="section_header flex_content margin-top">
@@ -414,6 +402,53 @@ p {
 				</div>
 				<div class="section_body flex_content">
 					<div class="flex_text center click_me"></div>	
+				</div>
+			</div>
+
+			
+			<div id="configuration" >
+				<div class="section_header flex_content margin-top closed">
+					<h2 class="flex_text center">Configuration</h2>
+					<h2 class="click_me">☰</h2>
+				</div>
+				<div class="section_body slider closed" >
+					<form class="flex_content">
+
+						<label for="data_gpio" class="flex_cell_even_split">Data GPIO</label>
+						<div class="flex_cell_even_split">
+							<input id="data_gpio" type="number" step="1" min="0" max="32" name="data_gpio" value="0">
+						</div>
+
+						<div class="break"></div>
+						
+						
+						<label for="num_rings" class="flex_cell_even_split">Number of Lights</label>
+						<div class="flex_cell_even_split">
+							<input id="num_rings" type="number" step="1" min="1" max="20" name="num_rings" value="1">
+						</div>
+						<div class="break"></div>
+						
+						<div class="matrix_container">
+							<!-- Template gets appended here -->
+						</div>
+							
+						<template id="data_row">
+							<div class="matrix_container_item" name="lights">
+								<div class="flex_cell_even_split">Strip x</div>
+							
+								<div class="flex_cell_even_split" >
+									<input type="number" name="strip_pixels" step="1" min="0" max="1000" value="0" required>
+								</div>
+								
+							</div>
+						</template>																		
+			
+						<div class="break"></div>
+						<div class="buttons">
+							<input class="light_config" type="button" value="Configure"/>
+						</div>
+					</form>
+
 				</div>
 			</div>
 
@@ -556,18 +591,130 @@ var selectedSSID = "";
 var connectAttempt = false;
 var statusTimer;
 var source; // global EventSource
+var config_esp_json;
 
 // sets all CSS and Javascript delays to the same value for slider
 var slidertransitiontime = 0.7 
 document.querySelector("html").style.setProperty('--slider-transistion-time', slidertransitiontime + 's');
 
 // immediately request 
+performGetLightsConfiguration();
 refreshAP();	
+
+/** UPDATE LIGHTS CONFIG **/
+
+/** Get data from NVS **/
+function performGetLightsConfiguration() {
+	fetch("/getconfig.json", {
+		cache: 'no-store',
+		headers: {
+		  'Content-Type': 'application/json'
+		},
+	}).then((response) => {
+		if (!response.ok) {
+			throw Error(response.statusText);
+		}
+		return response.json();
+	}).then((data) => {
+		config_esp_json = data;
+	
+		var num_rings = 0
+		if (config_esp_json.hasOwnProperty("pixel_layout")) {
+			num_rings = config_esp_json.pixel_layout.length;
+		}
+	
+		document.querySelector('#num_rings').value = num_rings;
+
+		updateLightsForm();
+		
+	}).catch((error) =>  {
+		console.log(error);
+	});  				
+}
+
+/** Update the form data when number of lights input changes **/
+document.querySelector('#num_rings').addEventListener('change', (e) => { 
+	// save currently entered data
+	updateLightsConfiguration();
+	// remove and readd form inputs
+	updateLightsForm();
+});
+
+function updateLightsForm() {
+	// update status led and invert
+	if (config_esp_json.hasOwnProperty("data_gpio")) {
+		document.querySelector('#data_gpio').value = config_esp_json.data_gpio;
+	}
+	
+	// prepare for lights config...
+	var num_rings = parseInt(document.querySelector("#num_rings").value);
+	var form_body = document.querySelector('#configuration .section_body .flex_content .matrix_container');
+	// remove exisiting items
+	form_body.innerHTML = "";
+	
+	// and re-add them from saved config data		
+	for(i = 0; i < num_rings; i++)  {
+		var clon = document.querySelector("#data_row").content.cloneNode(true);
+		
+		clon.querySelector('.matrix_container_item div').textContent = "Strip " + (i+1);
+
+		if (config_esp_json.hasOwnProperty("pixel_layout") && config_esp_json.pixel_layout[i]) {
+			clon.querySelector('[name="strip_pixels"]').value = config_esp_json.pixel_layout[i];		
+		}
+		form_body.appendChild(clon);
+	}
+}
+
+/** Saves current form data to global. Does not remove entries if num_rings is reduced **/
+function updateLightsConfiguration() {
+	config_esp_json.data_gpio = parseInt(document.querySelector('#data_gpio').value);
+
+	var lights = {};
+	var light_row = document.querySelectorAll('[name="lights"]');
+
+	if (!config_esp_json.hasOwnProperty("pixel_layout")) {
+		config_esp_json.pixel_layout = []; // create an array of numbers
+	}
+	for(var i = 0; i < light_row.length; i++)  {	
+		config_esp_json.pixel_layout[i] = parseInt(light_row[i].querySelector('[name="strip_pixels"]').value);			
+	}
+};
+
+/** Disable Update button if form is not valid **/
+document.querySelector('#configuration form').addEventListener('change', (e) => {
+	document.querySelector('#configuration .buttons .light_config').disabled = !document.querySelector('#configuration form').checkValidity();
+});
+
+/** Update button - send data to ESP to update configuration **/
+document.querySelector('#configuration .buttons .light_config').addEventListener('click', (e) => {
+	// save current form data
+	updateLightsConfiguration();
+
+	// remove excess entries
+	var num_rings = parseInt(document.querySelector("#num_rings").value);
+	config_esp_json.pixel_layout.splice(num_rings);
+			
+	fetch("/setconfig.json", {
+		method: 'POST',
+		cache: 'no-store',
+		headers: {
+		  'Content-Type': 'application/json'
+		},
+		body: JSON.stringify(config_esp_json)
+	}).then((response) =>  {
+		if (!response.ok) {
+			throw Error(response.statusText);
+		}
+	}).catch((error) =>  {
+		console.log(error);
+	});
+});
+
 
 /****** Wi-Fi *****/
 /** Connected Wi-Fi Info **/
 document.querySelector("#wifi-status .click_me").addEventListener("click", (e) => { 
-	document.querySelector("#wifi").classList.add("closed");
+	document.querySelector("#main_page").classList.add("closed");
 	setTimeout(function(){ document.querySelector("#connect-details").classList.remove("closed"); }, slidertransitiontime * 1000); 
 });
 
@@ -586,7 +733,7 @@ function refreshAP(){
 		}
 		return response.json();
 	}).then((data) => {
-		var ul = document.querySelector("#wifi ul");
+		var ul = document.querySelector("#main_page ul");
 		ul.innerHTML = "";
 		
 		data.forEach(function(e, idx, array) {
@@ -626,7 +773,7 @@ document.querySelector("#wifi-list ul").addEventListener("click", (e) => {
 		//this bubbles up looking for the li parent, then queries for the flex_text child underneath 
 		selectedSSID = e.target.closest(".flex_content").querySelector(".flex_text").textContent;					
 		document.querySelector("#connect h2 span").textContent = selectedSSID;
-		document.querySelector("#wifi").classList.add("closed");
+		document.querySelector("#main_page").classList.add("closed");
 		setTimeout(function(){ document.querySelector("#connect").classList.remove("closed"); }, slidertransitiontime * 1000); 
 	}
 });		
@@ -783,86 +930,58 @@ document.querySelector('#settings .buttons .update').addEventListener('click', (
 function performUpdate(){
 	closeModal();
 	
-	// inform 'main' partition to boot into 'boot' partition
-	fetch("/restart.json", {
+	document.querySelector("#modal h2").textContent = "Updating...";
+
+	var body = document.querySelector("#modal .section_body span");
+	var status = document.createElement("p");
+	status.textContent = "Beginning Update...";
+	body.appendChild(status);
+	var para = document.createElement("p");
+	para.innerHTML = "Please wait. If the update fails, check the console log for more information";
+	body.appendChild(para);
+	
+	var br = document.createElement("br");
+	body.appendChild(br);
+	
+	var div = document.createElement("div");
+	div.classList.add("prgbar");
+	div.style.width = "250px";
+	div.style.margin = "0 auto";
+	var progress_bar = document.createElement("div");
+	progress_bar.classList.add("bar");
+	progress_bar.style.width = "0%";
+	div.appendChild(progress_bar);
+	body.appendChild(div);
+	
+	var buttons = document.querySelector("#modal .section_body .buttons");
+	var ok_button = document.createElement("input");
+	ok_button.type = "button";
+	ok_button.value = "OK";
+	ok_button.addEventListener("click", closeModal);
+	buttons.appendChild(ok_button);
+	
+	document.querySelector("#modal").style.height = "300px";
+	openModal();
+
+	source.addEventListener("update", function(event) { // event: update
+		var data = JSON.parse(event.data);					
+		progress_bar.style.width = data["progress"]+"%";
+		status.textContent = data["status"];
+	});
+
+	var x = document.querySelector("#selected-file");
+	var file = x.files[0];
+
+	fetch("/updateboot", {
 		method: 'POST',
 		cache: 'no-store',
 		headers: {
-		  'Content-Type': 'application/json'
+		  'Content-Type': 'application/octet-stream'
 		},
-		body: JSON.stringify({ 
-			'update': true
-		})
+		body: file
 	}).then((response) =>  {
 		if (!response.ok) {
 			throw Error(response.statusText);
-		} 
-		else {
-			document.querySelector("#modal h2").textContent = "Updating...";
-
-			var body = document.querySelector("#modal .section_body span");
-			var status = document.createElement("p");
-			status.textContent = "Rebooting...";
-			body.appendChild(status);
-			var para = document.createElement("p");
-			para.innerHTML = "The ESP will restart into a bootloader mode.<br>Do <b>NOT</b> refresh your browser.<br>To begin the update, ensure you have reconnected to the ESP Wi-Fi. If the update fails, check the console log for more information";
-			body.appendChild(para);
-			
-			var br = document.createElement("br");
-			body.appendChild(br);
-			
-			var div = document.createElement("div");
-			div.classList.add("prgbar");
-			div.style.width = "250px";
-			div.style.margin = "0 auto";
-			var progress_bar = document.createElement("div");
-			progress_bar.classList.add("bar");
-			progress_bar.style.width = "0%";
-			div.appendChild(progress_bar);
-			body.appendChild(div);
-			
-			var buttons = document.querySelector("#modal .section_body .buttons");
-			var ok_button = document.createElement("input");
-			ok_button.type = "button";
-			ok_button.value = "OK";
-			ok_button.addEventListener("click", closeModal);
-			buttons.appendChild(ok_button);
-			
-			document.querySelector("#modal").style.height = "300px";
-			openModal();
-			
-			source.close(); // close current SSE session
-			
-			// wait a few seconds than attempt a reconnected to the boot partition SSE
-			setTimeout(function(){ 
-				serverSideEvents();
-				
-				source.addEventListener("update", function(event) { // event: update
-					var data = JSON.parse(event.data);					
-					progress_bar.style.width = data["progress"]+"%";
-					status.textContent = data["status"];
-					
-					if (data["status"] == "Connected..") {
-						var x = document.querySelector("#selected-file");
-						var file = x.files[0];
-
-						fetch("/send", {
-							method: 'POST',
-							cache: 'no-store',
-							headers: {
-							  'Content-Type': 'application/octet-stream'
-							},
-							body: file
-						}).then((response) =>  {
-							if (!response.ok) {
-								throw Error(response.statusText);
-							}
-						}).catch((error) =>  {
-							console.log(error);
-						});
-					}
-				});
-			}, 10000);
 		}
 	}).catch((error) =>  {
 		console.log(error);
@@ -961,19 +1080,24 @@ document.querySelectorAll('#app .buttons .ok').forEach((item) => {
 		document.querySelector("#connect-details").classList.add("closed");					
 		document.querySelector("#connect-wait").classList.add("closed");
 		document.querySelector("#connect").classList.add("closed");
-		setTimeout(function(){ document.querySelector("#wifi").classList.remove("closed"); }, slidertransitiontime * 1000); 
+		setTimeout(function(){ document.querySelector("#main_page").classList.remove("closed"); }, slidertransitiontime * 1000); 
 	})
 });	
 document.querySelector('#connect .buttons .cancel').addEventListener('click', (e) => { 
 	selectedSSID = "";		
 	document.querySelector("#connect").classList.add("closed");
-	setTimeout(function(){ document.querySelector("#wifi").classList.remove("closed"); }, slidertransitiontime * 1000); 			
+	setTimeout(function(){ document.querySelector("#main_page").classList.remove("closed"); }, slidertransitiontime * 1000); 			
 });	
 
 /** Settings - hide content **/
 document.querySelector('#settings .section_header .click_me').addEventListener('click', (e) => { 
 	document.querySelector("#settings .section_body").classList.toggle("closed");	
 	document.querySelector("#settings .section_header").classList.toggle("closed");				
+});	
+/** Configuration - hide content **/
+document.querySelector('#configuration .section_header .click_me').addEventListener('click', (e) => { 
+	document.querySelector("#configuration .section_body").classList.toggle("closed");	
+	document.querySelector("#configuration .section_header").classList.toggle("closed");				
 });	
 
 /** Modal Functions **/		

@@ -19,7 +19,7 @@ typedef struct {
 // HomeKit         hue 360.0f   saturation 100.0f   brightness   100(int)
 // NeoPixelBus     hue   1.0f    saturation   1.0f  brightness   1.0f
 
-void start_animation_task();
+esp_err_t start_animation_task();
 void set_strip(led_strip_t led_strip);
 void set_brightness(int brightness);
 

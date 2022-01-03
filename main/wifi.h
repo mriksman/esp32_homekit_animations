@@ -9,8 +9,9 @@ extern "C" {
 
 SemaphoreHandle_t* get_wifi_mutex();
 
-void wifi_init();
+void my_wifi_init();
 void start_ap_prov();
+esp_err_t my_wifi_deinit();
 
 #ifdef __cplusplus
 }

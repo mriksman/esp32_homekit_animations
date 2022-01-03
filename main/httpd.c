@@ -15,7 +15,6 @@
 #include "wifi.h"
 #include "httpd.h"
 #include <homekit/homekit.h>
-#include "lights.h"
 
 #include "esp_log.h"
 static const char *TAG = "myhttpd";
@@ -418,59 +417,77 @@ esp_err_t restart_json_handler(httpd_req_t *req)
     return ESP_OK;
 }
 
+
 /* POST handler for /updateboot. 
    Use curl to POST binary file to be updated to OTA_0 */
 esp_err_t update_boot_handler(httpd_req_t *req)
 {
-    char buffer[SCRATCH_BUFSIZE];
-    int len = 0;
-               
-    esp_ota_handle_t ota_handle; 
+    const esp_partition_t *configured = esp_ota_get_boot_partition();
+    const esp_partition_t *running = esp_ota_get_running_partition();
+
+    if (configured != running) {
+        ESP_LOGW(TAG, "Configured OTA boot partition at offset 0x%08x, but running from offset 0x%08x",
+                 configured->address, running->address);
+        ESP_LOGW(TAG, "(This can happen if either the OTA boot data or preferred boot image become corrupted somehow.)");
+    }
+    ESP_LOGI(TAG, "Running partition type %d subtype %d (offset 0x%08x)",
+             running->type, running->subtype, running->address);
+
+
     esp_err_t err = ESP_OK;
 
-    const esp_partition_t *boot_partition;
-    boot_partition = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, NULL);
-    if (boot_partition == NULL) {
-        err = ESP_ERR_OTA_SELECT_INFO_INVALID;
-    }
-
-    // File cannot be larger than partition size
-    if (boot_partition != NULL && req->content_len > boot_partition->size) {
-        ESP_LOGE(TAG, "Content-Length of %d larger than partition size of %d", req->content_len, boot_partition->size); 
-        err = ESP_ERR_INVALID_SIZE;
-    }
-
+    char buffer[SCRATCH_BUFSIZE];
+    char sse_msg[90];
+    int len = 0;
+    uint8_t progress = 0;
     int remaining = req->content_len;
     bool is_image_header_checked = false;
     bool more_content = true;
 
-    while (more_content) {
-        if (err == ESP_OK && len > sizeof(esp_image_header_t) && !is_image_header_checked) {
-            esp_image_header_t check_header; 
-            memcpy(&check_header, buffer, sizeof(esp_image_header_t));
-            int32_t entry = check_header.entry_addr - 0x40200010;
+    /* update handle : set by esp_ota_begin(), must be freed via esp_ota_end() */
+    esp_ota_handle_t update_handle = 0 ;
+    const esp_partition_t *update_partition = NULL;
 
-            if (check_header.magic != 0xE9) {
-                ESP_LOGE(TAG, "OTA image has invalid magic byte (expected 0xE9, saw 0x%x)", check_header.magic);
-                err = ESP_ERR_OTA_VALIDATE_FAILED;
-            }
-            else if ( (entry < boot_partition->address)  ||
-                (entry > boot_partition->address + boot_partition->size) ) {
-                ESP_LOGE(TAG, "OTA binary start entry 0x%x, partition start from 0x%x to 0x%x", entry, 
-                    boot_partition->address, boot_partition->address + boot_partition->size);
-                err = ESP_ERR_OTA_VALIDATE_FAILED;
+    update_partition = esp_ota_get_next_update_partition(NULL);
+    ESP_LOGI(TAG, "Writing to partition subtype %d at offset 0x%08x",
+             update_partition->subtype, update_partition->address);
+
+    if (update_partition == NULL) {
+        err = ESP_ERR_OTA_SELECT_INFO_INVALID;
+    }
+
+    // File cannot be larger than partition size
+    if (update_partition != NULL && req->content_len > update_partition->size) {
+        ESP_LOGE(TAG, "Content-Length of %d larger than partition size of %d", req->content_len, update_partition->size); 
+        err = ESP_ERR_INVALID_SIZE;
+    }
+
+    sprintf(sse_msg, "{\"progress\":\"10\", \"status\":\"Sending File Size %dKB\"}", (int)req->content_len/1024);
+    send_sse_message(sse_msg, "update");
+
+
+    while (more_content) {
+        if (err == ESP_OK && len > sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t) + sizeof(esp_app_desc_t) && !is_image_header_checked) {
+            esp_app_desc_t new_app_info;
+            // check current version with downloading
+            memcpy(&new_app_info, &buffer[sizeof(esp_image_header_t) + sizeof(esp_image_segment_header_t)], sizeof(esp_app_desc_t) );
+            ESP_LOGI(TAG, "New firmware version: %s", new_app_info.version);
+
+            esp_app_desc_t running_app_info;
+            if (esp_ota_get_partition_description(running, &running_app_info) == ESP_OK) {
+                ESP_LOGI(TAG, "Running firmware version: %s", running_app_info.version);
             }
 
             if (err == ESP_OK) {
                 // esp_ota_begin erases the partition, so only call it if the incoming file 
                 //  looks OK.
-                err = esp_ota_begin(boot_partition, OTA_SIZE_UNKNOWN, &ota_handle);
+                err = esp_ota_begin(update_partition, OTA_SIZE_UNKNOWN, &update_handle);
                 if (err != ESP_OK) {
                     ESP_LOGE(TAG, "Error esp_ota_begin()"); 
                 } 
                 else {
                     ESP_LOGI(TAG, "Writing to partition '%s' at offset 0x%x",
-                        boot_partition->label, boot_partition->address);
+                        update_partition->label, update_partition->address);
                 }
             }
             is_image_header_checked = true;
@@ -480,9 +497,16 @@ esp_err_t update_boot_handler(httpd_req_t *req)
         //  and send the HTTP error response back. stopping the connection early causes the client to
         //  display an ERROR CONNECTION CLOSED response instead of a meaningful error
         if (err == ESP_OK && is_image_header_checked) {
-            err = esp_ota_write(ota_handle, buffer, len);
+            err = esp_ota_write(update_handle, buffer, len);
         }
 
+        // we use int, so no decimals. only send message on 1% change. progress from 10->95%
+        if (req->content_len != 0 && progress != ((req->content_len-remaining)*85/req->content_len)+10) {
+            progress = ((req->content_len-remaining)*85/req->content_len)+10;    
+            sprintf(sse_msg, "{\"progress\":\"%d\", \"status\":\"Downloading..\"}", progress);
+            send_sse_message(sse_msg, "update");
+        }
+        
         remaining -= len;
 
         if (remaining != 0) {
@@ -503,19 +527,207 @@ esp_err_t update_boot_handler(httpd_req_t *req)
 
     ESP_LOGI(TAG, "Binary transferred finished: %d bytes", req->content_len);
 
-    if (ota_handle) {
-        err = esp_ota_end(ota_handle);
+    if (update_handle) {
+        err = esp_ota_end(update_handle);
     } 
+
+    err = esp_ota_set_boot_partition(update_partition);
+
+    const esp_partition_t *boot_partition = esp_ota_get_boot_partition();
+    ESP_LOGW(TAG, "Next boot partition '%s' at offset 0x%x",
+        boot_partition->label, boot_partition->address);
 
     if (err == ESP_OK) {
         httpd_resp_send(req, NULL, 0);
+        sprintf(sse_msg, "{\"progress\":\"100\", \"status\":\"Firmware Installed. Restarting to '%s'...\"}", boot_partition->label);
+        send_sse_message(sse_msg, "update");
     } else {
         httpd_resp_set_status(req, HTTPD_400);
         httpd_resp_send(req, NULL, 0);
+        sprintf(sse_msg, "{\"progress\":\"100\", \"status\":\"Failed. Restarting to '%s'...\"}", boot_partition->label);
+        send_sse_message(sse_msg, "update");
     }
-    
+
+    ESP_LOGI(TAG, "Prepare to restart system!");
+    vTaskDelay(pdMS_TO_TICKS(4000));
+    esp_restart();
+
     return ESP_OK;
 }
+
+/* GET handler for /getconfig.json. Gets config from NVS */
+esp_err_t getconfig_json_handler(httpd_req_t *req)
+{
+    esp_err_t err;
+
+    nvs_handle config_handle;
+    err = nvs_open("lights", NVS_READWRITE, &config_handle);
+    if (err == ESP_OK) {
+        char *out;
+        cJSON *root, *pixel_layout_json;
+
+        root = cJSON_CreateObject();
+
+        // Data GPIO
+        uint8_t data_gpio = 0;
+        err = nvs_get_u8(config_handle, "data_gpio", &data_gpio); 
+        if (err == ESP_OK) {
+            cJSON_AddItemToObject(root, "data_gpio", cJSON_CreateNumber(data_gpio));
+        }
+        else {
+            ESP_LOGW(TAG, "error nvs_get_u8 data_gpio err %d", err);
+        }
+
+        // Get configured number of rings/strips
+        uint8_t num_rings = 0;
+        err = nvs_get_u8(config_handle, "num_rings", &num_rings);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "error nvs_get_u8 num_rings err %d", err);
+        }
+
+        if (num_rings > 0) {
+            uint16_t pixel_layout[num_rings];
+            size_t size = num_rings * sizeof(uint16_t);
+            err = nvs_get_blob(config_handle, "pixel_layout", pixel_layout, &size);
+            if (err == ESP_OK) {
+                pixel_layout_json = cJSON_CreateArray();
+                cJSON_AddItemToObject(root, "pixel_layout", pixel_layout_json);
+
+                for (int i = 0; i < num_rings; i++) {
+                    cJSON_AddItemToArray(pixel_layout_json, cJSON_CreateNumber(pixel_layout[i]));
+                }
+            }
+            else {
+                ESP_LOGW(TAG, "error nvs_get_u8 pixel_layout err %d", err);
+            }
+        }
+
+        nvs_close(config_handle);
+
+        out = cJSON_PrintUnformatted(root);
+
+        httpd_resp_set_type(req, "application/json");
+        httpd_resp_set_hdr(req, "Cache-Control", "no-store, no-cache, must-revalidate, max-age=0");
+        httpd_resp_set_hdr(req, "Pragma", "no-cache");
+        httpd_resp_send(req, out, strlen(out));      
+
+        /* free all objects under root and root itself */
+        cJSON_Delete(root);
+        free(out);
+    }
+    else {
+        ESP_LOGE(TAG, "nvs_open err %d ", err);
+        httpd_resp_set_status(req, HTTPD_500);
+        httpd_resp_send(req, NULL, 0);
+    }
+
+    return ESP_OK;
+}
+
+/* POST handler for /setconfig.json. Taks json and saves to NVS */
+esp_err_t setconfig_json_handler(httpd_req_t *req)
+{
+    esp_err_t err;
+
+    int total_len = req->content_len;
+    int cur_len = 0;
+    char buf[SCRATCH_BUFSIZE];
+    int received = 0;
+
+    if (total_len >= SCRATCH_BUFSIZE) {
+        // Client will not receive response if it hasn't finished sending the POST data
+        // Can't store to buffer (too big), so just close connection
+        return ESP_FAIL;
+    }
+    while (cur_len < total_len) {
+        received = httpd_req_recv(req, buf + cur_len, total_len);
+        if (received <= 0) {
+            if (received == HTTPD_SOCK_ERR_TIMEOUT) {
+                    // Retry if timeout occurred
+                    continue;
+                }
+                ESP_LOGE(TAG, "JSON reception failed!");
+                return ESP_FAIL;
+        }
+        cur_len += received;
+    }
+    buf[total_len] = '\0';
+
+    nvs_handle config_handle;
+    err = nvs_open("lights", NVS_READWRITE, &config_handle);
+    if (err == ESP_OK) {
+        cJSON *root = cJSON_Parse(buf);
+
+        // Data GPIO Pin
+        cJSON *data_gpio_json = cJSON_GetObjectItem(root, "data_gpio");
+        if (cJSON_IsNumber(data_gpio_json) && data_gpio_json->valueint >= 0) { 
+            if (data_gpio_json->valueint <= 40 ) {
+                err = nvs_set_u8(config_handle, "data_gpio", data_gpio_json->valueint); 
+                if (err == ESP_OK) {
+                    ESP_LOGI(TAG, "data_gpio %d", data_gpio_json->valueint);
+                } else {
+                    ESP_LOGW(TAG, "error nvs_set_u8 data_gpio %d err %d", data_gpio_json->valueint, err);
+                }
+            }
+        } 
+        else {
+            ESP_LOGE(TAG, "error parsing data_gpio json");
+        }
+
+        // 'pixel_layout' is JSON name set in HTML
+        cJSON *pixel_layout_json = cJSON_GetObjectItem(root, "pixel_layout");
+
+        if (cJSON_IsArray(pixel_layout_json)) {
+            uint8_t num_rings = cJSON_GetArraySize(pixel_layout_json);
+
+            uint16_t pixel_layout[num_rings];
+            memset(pixel_layout, 0, num_rings * sizeof(uint16_t));
+
+            cJSON *fld;
+            uint8_t i = 0;
+            
+            cJSON_ArrayForEach(fld, pixel_layout_json) {
+                if (cJSON_IsNumber(fld) && fld->valueint >= 0) { 
+                    if (fld->valueint <= 999 ) {
+                        pixel_layout[i] = fld->valueint; 
+                        ESP_LOGI(TAG, "strip %d: %d pixels", i+1, pixel_layout[i]);
+                    }
+                }
+                i++;
+            }
+
+            err = nvs_set_u8(config_handle, "num_rings", num_rings);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "error nvs_set_u8 num_rings %d err %d", num_rings, err);
+            }
+
+            size_t size = num_rings * sizeof(uint16_t);
+            err = nvs_set_blob(config_handle, "pixel_layout", pixel_layout, size);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "error nvs_set_blob pixel_layout size %d err %d", size, err);
+            }
+        }
+        else {
+            ESP_LOGE(TAG, "error parsing config array json");
+        }
+        
+        err = nvs_commit(config_handle);
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "error nvs_commit err %d", err);
+        }
+
+        nvs_close(config_handle);
+        cJSON_Delete(root);
+    }
+    else {
+        ESP_LOGE(TAG, "nvs_open err %d ", err);
+    }
+ 
+    httpd_resp_send(req, NULL, 0);
+
+    return ESP_OK;
+}
+
 
 esp_err_t start_webserver(void)
 {
@@ -525,6 +737,7 @@ esp_err_t start_webserver(void)
     }
 
     httpd_config_t config = HTTPD_DEFAULT_CONFIG();
+    config.stack_size = 6072;
     config.max_open_sockets = 5;
     // kick off any old socket connections to allow new connections
     config.lru_purge_enable = true;
@@ -566,6 +779,24 @@ esp_err_t start_webserver(void)
         };
         httpd_register_uri_handler(server, &restart_json_page);
 
+        // Retrieve config from NVS. Requested when page first loads
+        httpd_uri_t getconfig_json_page = {
+            .uri       = "/getconfig.json",
+            .method    = HTTP_GET,
+            .handler   = getconfig_json_handler,
+            .user_ctx  = NULL
+        };
+        httpd_register_uri_handler(server, &getconfig_json_page);
+
+        // Saves config to NVS.
+        httpd_uri_t setconfig_json_page = {
+            .uri       = "/setconfig.json",
+            .method    = HTTP_POST,
+            .handler   = setconfig_json_handler,
+            .user_ctx  = NULL
+        };
+        httpd_register_uri_handler(server, &setconfig_json_page);
+
         // Client requesting Server Side Events
         httpd_uri_t server_side_event_registration_page = {
             .uri       = "/event",
@@ -575,7 +806,7 @@ esp_err_t start_webserver(void)
         };
         httpd_register_uri_handler(server, &server_side_event_registration_page);
 
-        // Not shown on the webpage. Used to update boot partition
+        // Used to update OTA
         httpd_uri_t update_boot_page = {
             .uri       = "/updateboot",
             .method    = HTTP_POST,

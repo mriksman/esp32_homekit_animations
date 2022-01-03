@@ -27,9 +27,9 @@ def ap_json():
 	    data = json.load(json_file)
     return jsonify(data)
 
-@app.route("/getlights.json", methods=["GET"])
+@app.route("/getconfig.json", methods=["GET"])
 def getlights_json():
-    with open(base_path+'\\tools\\getlights.json') as json_file:
+    with open(base_path+'\\tools\\getconfig.json') as json_file:
 	    data = json.load(json_file)
     return jsonify(data)
 
@@ -80,7 +80,7 @@ def stream():
     return Response(eventStream(), mimetype="text/event-stream")
 
 # /send URI would be on the 'boot' partition to accept 'main' update file
-@app.route("/send", methods=["POST"])
+@app.route("/updateboot", methods=["POST"])
 def send_update():
     global update
     update = "Downloading..."
@@ -89,4 +89,4 @@ def send_update():
         fp.write(request.data)
     return "File downloaded", 200
 
-app.run(host='0.0.0.0', debug=True)
+app.run(host='0.0.0.0', debug=True, threaded=True)

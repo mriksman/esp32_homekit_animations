@@ -4,28 +4,79 @@
 #include <sys/param.h>   
 #include <atomic>                       // note: this is a cpp file, so use <atomic>, not <stdatomic.h>
 
+#include "nvs_flash.h"
+
 #include "esp_log.h"
 static const char *TAG = "anim";
 
 #include <NeoPixelBus.h>
 #include <NeoPixelAnimator.h>
+#include "NeoStripTopology.h"
 
 #include "animation.h"
 
-const uint8_t PixelPin = 13;  
-const uint16_t PixelCount = 300;
-
-class MyRingsLayout
+class MyRingsLayout 
 {
+public:
+    void Begin() {
+        esp_err_t err;
+
+        nvs_handle config_handle;
+        err = nvs_open("lights", NVS_READWRITE, &config_handle);
+        if (err == ESP_OK) {
+            // Get configured number of rings/strips
+            uint8_t num_rings = 0;
+            err = nvs_get_u8(config_handle, "num_rings", &num_rings);
+            if (err != ESP_OK) {
+                ESP_LOGW(TAG, "error nvs_get_u8 num_rings err %d", err);
+            }
+
+            if (num_rings > 0) {
+                uint16_t pixel_layout[num_rings];
+                size_t size = num_rings * sizeof(uint16_t);
+                err = nvs_get_blob(config_handle, "pixel_layout", pixel_layout, &size);
+                // the device has been configured properly
+                if (err == ESP_OK) {
+                    RingCount = num_rings + 1;
+
+                    Rings = new uint16_t[RingCount];
+                    Rings[0] = 0;
+
+                    for (uint16_t i = 1; i < RingCount; i++) {
+                        Rings[i] = pixel_layout[i-1] + Rings[i-1];
+                    }
+                }
+                else {
+                    ESP_LOGW(TAG, "error nvs_get_u8 pixel_layout err %d", err);
+                }
+            }
+            nvs_close(config_handle);
+        }
+    }
+
 protected:
-    const uint16_t Rings[15] = {0, 20, 40, 60, 80, 100, 120, 145, 170, 190, 210, 230, 255, 280, PixelCount}; 
+    uint16_t* Rings; 
+    uint8_t RingCount = 0;
+
+    uint8_t _ringCount() const
+    {
+        return RingCount;
+    }
 };
-// use the MyRingsLayout to declare the topo object
-NeoRingTopology<MyRingsLayout> stairs;
+
+NeoDynamicRingTopology<MyRingsLayout> segment;
+
 
 // Default is NeoEsp32Rmt6Ws2812xMethod (channel 6)
-NeoPixelBus<NeoGrbwFeature, Neo800KbpsMethod> strip(PixelCount, PixelPin);
-NeoPixelAnimator animations(PixelCount, NEO_CENTISECONDS);
+//NeoPixelBus<NeoGrbwFeature, Neo800KbpsMethod> strip(PixelCount, PixelPin);
+
+//NeoPixelBus<NeoGrbwFeature, NeoEsp32I2s1Sk6812Method> strip(PixelCount, PixelPin); // using i2s
+//NeoPixelBus<NeoGrbwFeature, NeoEsp32Rmt0Sk6812Method> strip(PixelCount, PixelPin); // using RMT
+NeoPixelBus<NeoGrbwFeature, NeoEsp32Rmt0Sk6812Method>* strip = NULL;
+
+//NeoPixelAnimator animations(PixelCount, NEO_CENTISECONDS);
+NeoPixelAnimator* animations = NULL;
+
 
 static QueueHandle_t s_led_message_queue;
 
@@ -45,19 +96,41 @@ void FadeAnimationSet(HsbColor targetColor, int8_t direction)
     rgbwTargetColor.R = rgbwTargetColor.R - rgbwTargetColor.W; 
     rgbwTargetColor.G = rgbwTargetColor.G - rgbwTargetColor.W; 
     rgbwTargetColor.B = rgbwTargetColor.B - rgbwTargetColor.W; 
+    rgbwTargetColor.W *= 0.8;
 
     // can gamma correct using Rgbw compatible NeoGamma
     NeoGamma<NeoGammaTableMethod> colorGamma;
     rgbwTargetColor = colorGamma.Correct(rgbwTargetColor);
 
     // use pixel color of pixel(0) as the start color to transition from
-    RgbwColor originalColor = strip.GetPixelColor(0);
+    RgbwColor originalColor = strip->GetPixelColor(0);
+
+    // this runs AFTER the fade animation below. Normally, when an animation finishes, the last pixel colour stays forever. 
+    //   Due to wiring issue, I sometimes get odd pixel colours appear, as the data wire I use is effectively acting as an antenna.
+    //   So, I need to keep refreshing all the pixel colours.
+    AnimUpdateCallback refreshColour = [=](const AnimationParam& param)
+    {
+        // only update the pixels once (at the start of the animation)
+        if (param.state == AnimationState_Started) {
+            uint8_t NumSteps = segment.getCountOfRings();
+            for (uint8_t j = 0; j < NumSteps; j++) {
+                uint16_t StepWidth = segment.getPixelCountAtRing(j);
+                for (uint16_t i = 0; i < StepWidth; i++) {
+                    strip->SetPixelColor(segment.Map(j, i), rgbwTargetColor);
+                }
+            }
+        }
+
+        if (param.state == AnimationState_Completed) {
+            animations->RestartAnimation(param.index);
+        }
+    };
 
     AnimUpdateCallback animUpdate = [=](const AnimationParam& param)
     {
         float step_progress;
 
-        uint8_t NumSteps = stairs.getCountOfRings();
+        uint8_t NumSteps = segment.getCountOfRings();
 
         // use 'direction' to start fade from top or bottom
         for (uint8_t j = 0; j < NumSteps; j++) {
@@ -73,25 +146,29 @@ void FadeAnimationSet(HsbColor targetColor, int8_t direction)
                 step_progress  
             );
 
-            uint16_t StepWidth = stairs.getPixelCountAtRing(j);
+            uint16_t StepWidth = segment.getPixelCountAtRing(j);
             for (uint16_t i = 0; i < StepWidth; i++) {
-                strip.SetPixelColor(stairs.Map(j, i), updatedColor);
+                strip->SetPixelColor(segment.Map(j, i), updatedColor);
             }
         }
 
         // once fade is complete, don't restart
         if (param.state == AnimationState_Completed) {
-            animations.StopAnimation(param.index);
+            animations->StopAnimation(param.index);
+
+            // see above. I need to keep refreshing the pixel colours periodically
+            animations->StartAnimation(0, 500, refreshColour);
+
         }
     };
 
-    animations.StartAnimation(0, direction != 0 ? 300 : 100, animUpdate);
+    animations->StartAnimation(0, direction != 0 ? 300 : 100, animUpdate);
 
 }
 // ************************************************************************
 
 
-// Stores NUM_COLOR_CYCLE colors and cycle up the stairs
+// Stores NUM_COLOR_CYCLE colors and cycle up the segment
 void ColorCycleAnimationSet(float hue, float saturation)
 {
     // static variables maintain values between function calls
@@ -112,7 +189,7 @@ void ColorCycleAnimationSet(float hue, float saturation)
     // spend more time at start/end (to see the color), rather than during the linear blend
     AnimEaseFunction easing =  NeoEase::ExponentialInOut;
 
-    uint8_t NumSteps = stairs.getCountOfRings();
+    uint8_t NumSteps = segment.getCountOfRings();
     for (uint8_t j = 0; j < NumSteps; j++) {
 
         AnimUpdateCallback animUpdate = [=](const AnimationParam& param)
@@ -150,17 +227,17 @@ void ColorCycleAnimationSet(float hue, float saturation)
             // LinearBlend can work with hsb color objects
             RgbwColor color = RgbwColor::LinearBlend(selectedColors[this_color], selectedColors[next_color], progress);
 
-            uint16_t StepWidth = stairs.getPixelCountAtRing(j);
+            uint16_t StepWidth = segment.getPixelCountAtRing(j);
             for (uint16_t i = 0; i < StepWidth; i++) {
-                strip.SetPixelColor(stairs.Map(j, i), color);
+                strip->SetPixelColor(segment.Map(j, i), color);
             }
 
             if (param.state == AnimationState_Completed) {
-                animations.RestartAnimation(j);
+                animations->RestartAnimation(j);
             }
         };
 
-        animations.StartAnimation(j, 200*NUM_COLOR_CYCLE, animUpdate);
+        animations->StartAnimation(j, 200*NUM_COLOR_CYCLE, animUpdate);
     }
 
 }
@@ -170,7 +247,7 @@ void RainbowFadeAnimationSet()
 {
     AnimUpdateCallback animUpdate = [=](const AnimationParam& param)
     {
-        uint8_t NumSteps = stairs.getCountOfRings();
+        uint8_t NumSteps = segment.getCountOfRings();
         for (uint8_t j = 0; j < NumSteps; j++) {
             float hue = param.progress + (1.0*j/NumSteps);
             if (hue > 1) {
@@ -184,19 +261,19 @@ void RainbowFadeAnimationSet()
 
             HsbColor color = HsbColor(hue, 1.0f, brightness);
 
-            uint16_t StepWidth = stairs.getPixelCountAtRing(j);
+            uint16_t StepWidth = segment.getPixelCountAtRing(j);
             for (uint16_t i = 0; i < StepWidth; i++) {
-                strip.SetPixelColor(stairs.Map(j, i), color);
+                strip->SetPixelColor(segment.Map(j, i), color);
             }
         }
 
         // no need to call parent setup function RainbowFadeAnimationSet(). just restart animation
         if (param.state == AnimationState_Completed) {
-            animations.RestartAnimation(param.index);
+            animations->RestartAnimation(param.index);
         }
     };
 
-    animations.StartAnimation(0, 1000, animUpdate);
+    animations->StartAnimation(0, 1000, animUpdate);
 
 }
 
@@ -204,10 +281,10 @@ void RainbowFadeAnimationSet()
 void FlickerAnimationSet(float hue, float saturation)
 {
     // Every pixel is a standalone animation
-    for (uint16_t pixel = 0; pixel < PixelCount; pixel++)
+    for (uint16_t pixel = 0; strip->PixelCount(); pixel++)
     {
         // we need the current brightness of the pixel at the start of the animation
-        RgbwColor startColorRgbw = strip.GetPixelColor(pixel);
+        RgbwColor startColorRgbw = strip->GetPixelColor(pixel);
 
         // we need hsb color to set start color, so use the retrieved rgbw pixel and convert to hsb
         HsbColor startColor = HsbColor(RgbColor(startColorRgbw.R, startColorRgbw.G, startColorRgbw.B));
@@ -246,20 +323,26 @@ void FlickerAnimationSet(float hue, float saturation)
             break;
         }
 
+
+
+        easing = NeoEase::Linear;
+
+
+
         AnimUpdateCallback animUpdate = [=](const AnimationParam& param)
         {
             float progress = easing(param.progress);
 
             RgbwColor updatedColor = RgbwColor::LinearBlend(startColor, targetColor, progress);
-            strip.SetPixelColor(pixel, updatedColor);
+            strip->SetPixelColor(pixel, updatedColor);
 
             // once ALL animations have completed, run it all again
-            if (!animations.IsAnimating()) {
+            if (!animations->IsAnimating()) {
                 FlickerAnimationSet(hue, saturation);
             }
         };
 
-        animations.StartAnimation(pixel, 200, animUpdate);
+        animations->StartAnimation(pixel, 200, animUpdate);
     }
 }
 
@@ -267,10 +350,10 @@ void FlickerAnimationSet(float hue, float saturation)
 void GlitterAnimationSet()
 {
     // Every pixel is a standalone animation
-    for (uint16_t pixel = 0; pixel < PixelCount; pixel++)
+    for (uint16_t pixel = 0; pixel < strip->PixelCount(); pixel++)
     {
         // each animation starts with the color that was present
-        RgbwColor startColorRgbw = strip.GetPixelColor(pixel);
+        RgbwColor startColorRgbw = strip->GetPixelColor(pixel);
 
         // select target brightness. don't let brightness go higher than global brightness
         float brightness = atomic_brightness/100.0f;
@@ -316,15 +399,15 @@ void GlitterAnimationSet()
 
             // LinearBlend can accept Rgbw and Hsb color objects
             RgbwColor updatedColor = RgbwColor::LinearBlend(startColorRgbw, targetColor, progress);
-            strip.SetPixelColor(pixel, updatedColor);
+            strip->SetPixelColor(pixel, updatedColor);
 
             // once ALL animations have completed, run it all again
-            if (!animations.IsAnimating()) {
+            if (!animations->IsAnimating()) {
                 GlitterAnimationSet();
             }
         };
 
-        animations.StartAnimation(pixel, 200, animUpdate);
+        animations->StartAnimation(pixel, 200, animUpdate);
 
     }
 }
@@ -356,21 +439,21 @@ void CylonAnimationSet()
 
         // darken all pixels
         int darken_by = 50 * hsbColor.B + 1;
-        for (uint16_t i = 0; i < PixelCount; i++) {
-            RgbwColor pixel_color = strip.GetPixelColor(i);
+        for (uint16_t i = 0; i < strip->PixelCount(); i++) {
+            RgbwColor pixel_color = strip->GetPixelColor(i);
             pixel_color.Darken(darken_by);
-            strip.SetPixelColor(i, pixel_color);
+            strip->SetPixelColor(i, pixel_color);
         }
 
         // use the curved progress to calculate the pixel to effect.
         uint16_t next_pixel;
         if (s_direction > 0) {
-            next_pixel = progress * PixelCount;
+            next_pixel = progress * strip->PixelCount();
         }
         else {
-            next_pixel = (1.0f - progress) * PixelCount;
+            next_pixel = (1.0f - progress) * strip->PixelCount();
         }
-        if (next_pixel == PixelCount) {
+        if (next_pixel == strip->PixelCount()) {
             next_pixel -= 1;
         }
 
@@ -380,7 +463,7 @@ void CylonAnimationSet()
         uint8_t i = 0;
         do {
             uint16_t i_pixel = next_pixel - i * s_direction;
-            strip.SetPixelColor(i_pixel, hsbColor);
+            strip->SetPixelColor(i_pixel, hsbColor);
             i++;
         } while ( i < pixel_diff);
 
@@ -391,20 +474,20 @@ void CylonAnimationSet()
 
             // time is centiseconds
             uint16_t time = 1000 + esp_random()%1000;
-            animations.AnimationDuration(time);
-            animations.RestartAnimation(param.index);
+            animations->AnimationDuration(time);
+            animations->RestartAnimation(param.index);
         }
     };
 
     // start animation for the first time
     uint16_t time = 1000 + esp_random()%1000;
-    animations.StartAnimation(0, time, animUpdate);
+    animations->StartAnimation(0, time, animUpdate);
 }
 
 // Each step has an animated back and forth 'Cylon' transition
 void StepCylonAnimationSet()
 {
-    uint8_t NumSteps = stairs.getCountOfRings();
+    uint8_t NumSteps = segment.getCountOfRings();
     for (uint8_t j = 0; j < NumSteps; j++) {
         
         AnimUpdateCallback animUpdate = [=](const AnimationParam& param)
@@ -418,7 +501,7 @@ void StepCylonAnimationSet()
                 brightness = fmax(0.03, brightness);
 
                 HsbColor hsbColor = HsbColor(hue, 1.0, brightness);                
-                strip.SetPixelColor(stairs.Map(j, 0), hsbColor);
+                strip->SetPixelColor(segment.Map(j, 0), hsbColor);
            }
 
             float progress;
@@ -434,7 +517,7 @@ void StepCylonAnimationSet()
             AnimEaseFunction easing = NeoEase::QuarticInOut;
             progress = easing(progress);
 
-            uint16_t StepWidth = stairs.getPixelCountAtRing(j);
+            uint16_t StepWidth = segment.getPixelCountAtRing(j);
 
             int16_t next_pixel, last_pixel;
             // use the curved progress to calculate next pixel. pixels are 0 -> StepWidth-1
@@ -452,15 +535,15 @@ void StepCylonAnimationSet()
             // not storing s_last_pixel, so iterate backwards and find the leading edge of the trail
             for (last_pixel = next_pixel; ; last_pixel -= direction) {
                 // GetPixelColor returns a Rgbw color object
-                uint8_t this_brightness = strip.GetPixelColor(stairs.Map(j, last_pixel)).CalculateBrightness();
-                uint8_t prev_brightness = strip.GetPixelColor(stairs.Map(j, last_pixel + direction)).CalculateBrightness();
+                uint8_t this_brightness = strip->GetPixelColor(segment.Map(j, last_pixel)).CalculateBrightness();
+                uint8_t prev_brightness = strip->GetPixelColor(segment.Map(j, last_pixel + direction)).CalculateBrightness();
 
                 if (last_pixel == 0 || last_pixel == StepWidth - 1) {
                     prev_brightness = 0;
                 }
 
                 if (this_brightness > prev_brightness ) {
-                    color = strip.GetPixelColor(stairs.Map(j, last_pixel));
+                    color = strip->GetPixelColor(segment.Map(j, last_pixel));
                     break;
                 } 
             }
@@ -471,9 +554,9 @@ void StepCylonAnimationSet()
             // darken the pixels on the strip
             for (uint16_t i = 0; i < StepWidth; i++)
             {
-                RgbwColor pixel_color = strip.GetPixelColor(stairs.Map(j, i));
+                RgbwColor pixel_color = strip->GetPixelColor(segment.Map(j, i));
                 pixel_color.Darken(darken_by);
-                strip.SetPixelColor(stairs.Map(j, i), pixel_color);
+                strip->SetPixelColor(segment.Map(j, i), pixel_color);
             }
 
             // how many pixels missed?
@@ -482,20 +565,20 @@ void StepCylonAnimationSet()
             uint8_t i = 0;
             do {
                 uint16_t i_pixel = next_pixel - i * direction;
-                strip.SetPixelColor(stairs.Map(j, i_pixel), color);
+                strip->SetPixelColor(segment.Map(j, i_pixel), color);
                 i++;
             } while ( i < pixel_diff);
 
             if (param.state == AnimationState_Completed) {
                 uint16_t time = 400 + esp_random()%600;
-                animations.ChangeAnimationDuration(j, time);
-                animations.RestartAnimation(j);
+                animations->ChangeAnimationDuration(j, time);
+                animations->RestartAnimation(j);
             }
         };
 
         // start the animation for the first time
         uint16_t time = 400 + esp_random()%600;
-        animations.StartAnimation(j, time, animUpdate);
+        animations->StartAnimation(j, time, animUpdate);
     }
 }
 
@@ -526,21 +609,21 @@ void SnakeAnimationSet()
 
         // darken all pixels
         int darken_by = 50 * hsbColor.B + 1;
-        for (uint16_t i = 0; i < PixelCount; i++) {
-            RgbwColor pixel_color = strip.GetPixelColor(i);
+        for (uint16_t i = 0; i < strip->PixelCount(); i++) {
+            RgbwColor pixel_color = strip->GetPixelColor(i);
             pixel_color.Darken(darken_by);
-            strip.SetPixelColor(i, pixel_color);
+            strip->SetPixelColor(i, pixel_color);
         }
 
         // work out which pixel is next
         uint16_t next_pixel;
         if (s_direction > 0) {
-            next_pixel = progress * PixelCount;
+            next_pixel = progress * strip->PixelCount();
         }
         else {
-            next_pixel = (1.0f - progress) * PixelCount;
+            next_pixel = (1.0f - progress) * strip->PixelCount();
         }
-        if (next_pixel == PixelCount) {
+        if (next_pixel == strip->PixelCount()) {
             next_pixel -= 1;
         }
 
@@ -554,20 +637,20 @@ void SnakeAnimationSet()
             uint16_t pixel_count = 0;
             uint16_t i_pixel = next_pixel - i * s_direction;
 
-            uint8_t NumSteps = stairs.getCountOfRings();
+            uint8_t NumSteps = segment.getCountOfRings();
             for (step_num = 0; step_num < NumSteps; step_num++ ) {
                 pixel_num = i_pixel - pixel_count;
-                pixel_count += stairs.getPixelCountAtRing(step_num);  
+                pixel_count += segment.getPixelCountAtRing(step_num);  
                 if (pixel_count > i_pixel) {
                     break;
                 }
             }
 
             if(step_num % 2 == 0) {
-                pixel_num = stairs.getPixelCountAtRing(step_num) - pixel_num -1;
+                pixel_num = segment.getPixelCountAtRing(step_num) - pixel_num -1;
             }
 
-            strip.SetPixelColor(stairs.Map(step_num, pixel_num), hsbColor);
+            strip->SetPixelColor(segment.Map(step_num, pixel_num), hsbColor);
 
             i++;
         } while ( i < pixel_diff);
@@ -578,13 +661,13 @@ void SnakeAnimationSet()
             s_direction *= -1;
 
             uint16_t time = 1000 + esp_random()%1000;
-            animations.AnimationDuration(time);
-            animations.RestartAnimation(param.index);
+            animations->AnimationDuration(time);
+            animations->RestartAnimation(param.index);
         }
     };
 
     uint16_t time = 1000 + esp_random()%1000;
-    animations.StartAnimation(0, time, animUpdate);
+    animations->StartAnimation(0, time, animUpdate);
 }
 
 
@@ -592,10 +675,10 @@ void FireworksAnimationSetHsb()
 {
     // Set random pixels on (exclude bottom and top step)
 
-    for (uint16_t indexPixel = stairs.getPixelCountAtRing(0); indexPixel < PixelCount - stairs.getPixelCountAtRing(stairs.getCountOfRings()-1); indexPixel++)  {
+    for (uint16_t indexPixel = segment.getPixelCountAtRing(0); indexPixel < strip->PixelCount() - segment.getPixelCountAtRing(segment.getCountOfRings()-1); indexPixel++)  {
         if(esp_random()%300 == 0) {
             HsbColor hsbColor = HsbColor(1.0f*esp_random()/UINT32_MAX, 1.0, ( 0.2f + (1.0f*esp_random()/UINT32_MAX)/2.0f ));
-            strip.SetPixelColor(indexPixel, hsbColor);
+            strip->SetPixelColor(indexPixel, hsbColor);
         }
     }
 
@@ -608,25 +691,25 @@ void FireworksAnimationSetHsb()
         // the brightest pixel, and then decrements away. However, the decrement comes after
         // the brightest pixel, so if you dim that and then move to the next pixel, it would be a
         // different value than the left pixel used as a value.
-        for (uint16_t i = 0; i < PixelCount; i++ ) {
-            RgbwColor color = strip.GetPixelColor(i);
+        for (uint16_t i = 0; i < strip->PixelCount(); i++ ) {
+            RgbwColor color = strip->GetPixelColor(i);
             HsbColor hsbColor = HsbColor(RgbColor(color.R, color.G, color.B));
             hsbColor = HsbColor(hsbColor.H, 1.0, hsbColor.B/1.1f);
-            strip.SetPixelColor(i, hsbColor);
+            strip->SetPixelColor(i, hsbColor);
         }
 
         // Left to Right first
-        uint8_t NumSteps = stairs.getCountOfRings();
+        uint8_t NumSteps = segment.getCountOfRings();
         for (uint16_t j = 0; j < NumSteps; j++ ) {
-            uint16_t StepWidth = stairs.getPixelCountAtRing(j);
+            uint16_t StepWidth = segment.getPixelCountAtRing(j);
             for (uint16_t i = 0; i < StepWidth; i++) {
                 RgbwColor this_pixel, left_pixel, right_pixel;
                 HsbColor hsb_this_pixel, hsb_left_pixel, hsb_right_pixel;
                 float brightness = 0.0, hue = 0.0;
 
-                this_pixel = strip.GetPixelColor(stairs.Map(j, i));
-                left_pixel = strip.GetPixelColor(stairs.Map(j, i-1));
-                right_pixel = strip.GetPixelColor(stairs.Map(j, i+1));
+                this_pixel = strip->GetPixelColor(segment.Map(j, i));
+                left_pixel = strip->GetPixelColor(segment.Map(j, i-1));
+                right_pixel = strip->GetPixelColor(segment.Map(j, i+1));
 
                 hsb_this_pixel = HsbColor(RgbColor(this_pixel.R, this_pixel.G, this_pixel.B));
                 hsb_left_pixel = HsbColor(RgbColor(left_pixel.R, left_pixel.G, left_pixel.B));
@@ -650,21 +733,21 @@ void FireworksAnimationSetHsb()
                 brightness = brightness > 1.0 ? 1.0 : brightness;
 
                 HsbColor color = HsbColor(hue, 1.0f, brightness);
-                strip.SetPixelColor(stairs.Map(j, i), color);
+                strip->SetPixelColor(segment.Map(j, i), color);
             }
         }
 
         // Bottom to Top
-        uint16_t StepWidth = stairs.getPixelCountAtRing(0);
+        uint16_t StepWidth = segment.getPixelCountAtRing(0);
         for (uint16_t i = 0; i < StepWidth; i++) {
             for (uint16_t j = 0; j < NumSteps; j++ ) {
                 RgbwColor this_pixel, bottom_pixel, top_pixel;
                 HsbColor hsb_this_pixel, hsb_bottom_pixel, hsb_top_pixel;
                 float brightness = 0.0, hue = 0.0;
 
-                this_pixel = strip.GetPixelColor(stairs.Map(j, i));
-                bottom_pixel = strip.GetPixelColor(stairs.Map(j-1, i));
-                top_pixel = strip.GetPixelColor(stairs.Map(j+1, i));
+                this_pixel = strip->GetPixelColor(segment.Map(j, i));
+                bottom_pixel = strip->GetPixelColor(segment.Map(j-1, i));
+                top_pixel = strip->GetPixelColor(segment.Map(j+1, i));
 
                 hsb_this_pixel = HsbColor(RgbColor(this_pixel.R, this_pixel.G, this_pixel.B));
                 hsb_bottom_pixel = HsbColor(RgbColor(bottom_pixel.R, bottom_pixel.G, bottom_pixel.B));
@@ -688,7 +771,7 @@ void FireworksAnimationSetHsb()
                 brightness = brightness > 1.0 ? 1.0 : brightness;
 
                 HsbColor color = HsbColor(hue, 1.0f, brightness);
-                strip.SetPixelColor(stairs.Map(j, i), color);
+                strip->SetPixelColor(segment.Map(j, i), color);
             }
         }
 
@@ -702,7 +785,7 @@ void FireworksAnimationSetHsb()
 
     // fire off the animation even before the previous firework has faded away
     // this ensures fireworks are being generated at random times
-    animations.StartAnimation(0, 50, animUpdate);
+    animations->StartAnimation(0, 50, animUpdate);
     
 }
 
@@ -710,13 +793,13 @@ void FireworksAnimationSetHsb()
 
 void animation_task(void * param)
 {
-    strip.Begin();   
-    strip.Show();
+    strip->Begin();   
+    strip->Show();
 
     while(1) {
-        if (animations.IsAnimating()) {
-            animations.UpdateAnimations();
-            strip.Show();
+        if (animations->IsAnimating()) {
+            animations->UpdateAnimations();
+            strip->Show();
         }
         vTaskDelay(3);
     }
@@ -727,12 +810,21 @@ void animation_select_task(void * param)
     s_led_message_queue = xQueueCreate( 10, sizeof(led_strip_t));
     led_strip_t led_strip;
 
+    led_strip.hue               = 0.0f;
+    led_strip.saturation        = 0.0f;
+    led_strip.brightness        = 0;
+    led_strip.animate           = false;
+
+    set_strip(led_strip);
+
     while(1) {
         if (xQueueReceive(s_led_message_queue, (void *) &led_strip, portMAX_DELAY) == pdTRUE) {
             if (led_strip.animate) {
-                animations.StopAll();
-                strip.ClearTo(HsbColor(0.0, 0.0, 0.0));
-                strip.Show();
+                animations->StopAll();
+                strip->ClearTo(HsbColor(0.0, 0.0, 0.0));
+                strip->Show();
+
+                vTaskDelay(50);
 
                 atomic_brightness = led_strip.brightness;
                 
@@ -765,8 +857,8 @@ void animation_select_task(void * param)
             } 
             
             else {
-                if (animations.IsAnimating()) {
-                    animations.StopAll();
+                if (animations->IsAnimating()) {
+                    animations->StopAll();
                 }
                 // look at custom/switch id and determine direction for fade
                 int8_t direction = 0;
@@ -787,10 +879,57 @@ void animation_select_task(void * param)
     }
 }
 
-void start_animation_task() {
+esp_err_t start_animation_task() {
+
+    esp_err_t err;
+    nvs_handle config_handle;
+    uint8_t data_gpio;
+    err = nvs_open("lights", NVS_READWRITE, &config_handle);
+    if (err == ESP_OK) {
+        // Data GPIO
+        err = nvs_get_u8(config_handle, "data_gpio", &data_gpio); 
+        if (err != ESP_OK) {
+            ESP_LOGW(TAG, "error nvs_get_u8 data_gpio err %d", err);
+        }
+        nvs_close(config_handle);
+    }
+    if (err != ESP_OK) {
+        ESP_LOGE(TAG, "unable to create strip or animations object. data pin not defined");
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    // read in pixel_layout
+    segment.Begin();
+
+    if (segment.getCountOfRings() == 0) {
+        ESP_LOGE(TAG, "unable to create strip or animations object. ring/strip not defined");
+        return ESP_ERR_NOT_FOUND;
+    }
+
+    ESP_LOGI(TAG, "Ring/segment size %d.     Num Pixels % d", segment.getCountOfRings(), segment.getPixelCount());
+
+    if (strip != NULL) {  
+       delete strip;
+    }
+    if (animations != NULL) {  
+       delete animations;
+    }
+
+    strip = new NeoPixelBus<NeoGrbwFeature, NeoEsp32Rmt0Sk6812Method>(segment.getPixelCount(), data_gpio);   // using RMT
+    animations = new NeoPixelAnimator(segment.getPixelCount(), NEO_CENTISECONDS);
+
+    if (strip == NULL || animations == NULL) {
+        ESP_LOGE(TAG, "unable to create strip or animations object. out of memory");
+        return ESP_ERR_NO_MEM;
+    }
+
+
+
     xTaskCreatePinnedToCore(&animation_task, "anim", 4096, NULL, 10, NULL, 1);
 
     xTaskCreate(&animation_select_task, "anim_select", 4096, NULL, 5, NULL);
+
+    return ESP_OK;
 }
 
 void set_strip(led_strip_t led_strip) {
