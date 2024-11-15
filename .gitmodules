@@ -1,3 +1,0 @@
-[submodule "components/homekit"]
-	path = components/homekit
-	url = https://github.com/maximkulkin/esp-homekit.git
