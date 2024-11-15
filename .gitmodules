@@ -1,0 +1,3 @@
+[submodule "components/neopixelbus"]
+	path = components/neopixelbus
+	url = https://github.com/mriksman/esp-neopixelbus.git
