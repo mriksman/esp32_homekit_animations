@@ -27,20 +27,13 @@ ESP_EVENT_DEFINE_BASE(BUTTON_EVENT);            // Convert button events into es
 
 #include <homekit/homekit.h>
 #include <homekit/characteristics.h>
-#ifdef CONFIG_IDF_TARGET_ESP8266
-    #include "mdns.h"                           // ESP8266 RTOS SDK mDNS needs legacy STATUS_EVENT to be sent to it
-#endif
+
 ESP_EVENT_DEFINE_BASE(HOMEKIT_EVENT);           // Convert esp-homekit events into esp event system      
 
 #include "animation.h"
 
 #include "esp_log.h"
 static const char *TAG = "main";
-
-// Have set lwip sockets from 10 to 16 (maximum allowed)
-//   5 for httpd (down from default of 7)
-//   12 for HomeKit (up from 8)
-
 
 static bool paired = false;
 
@@ -290,15 +283,7 @@ static void main_event_handler(void* arg, esp_event_base_t event_base,
             //homekit_service_t *service = accessory->services[service_idx];
 
             if (event_id == 1) {
-                /*
-                ESP_LOGI(TAG, "wifi deinit"); 
-                esp_err_t err = my_wifi_deinit();
-            
-                if (err == ESP_ERR_WIFI_NOT_INIT) {
-                    ESP_LOGI(TAG, "wifi already deinit. init wifi"); 
-                    my_wifi_init();
-                } 
-                */
+
             }
 
             else if (event_id == 4) {
@@ -513,35 +498,11 @@ void app_main(void)
 
     ESP_ERROR_CHECK(esp_event_loop_create_default());
 
-   // esp_event_handler_register is being deprecated
-    #ifdef CONFIG_IDF_TARGET_ESP32
-        ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, main_event_handler, NULL, NULL));
-        ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, ESP_EVENT_ANY_ID, main_event_handler, NULL, NULL));
-        ESP_ERROR_CHECK(esp_event_handler_instance_register(HOMEKIT_EVENT, ESP_EVENT_ANY_ID, main_event_handler, NULL, NULL));
-        ESP_ERROR_CHECK(esp_event_handler_instance_register(BUTTON_EVENT, ESP_EVENT_ANY_ID, main_event_handler, NULL, NULL));
-    #elif CONFIG_IDF_TARGET_ESP8266
-        ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, main_event_handler, NULL));
-        ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, main_event_handler, NULL));
-        ESP_ERROR_CHECK(esp_event_handler_register(HOMEKIT_EVENT, ESP_EVENT_ANY_ID, main_event_handler, NULL));
-        ESP_ERROR_CHECK(esp_event_handler_register(BUTTON_EVENT, ESP_EVENT_ANY_ID, main_event_handler, NULL));
-    #endif
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, main_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, ESP_EVENT_ANY_ID, main_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(HOMEKIT_EVENT, ESP_EVENT_ANY_ID, main_event_handler, NULL, NULL));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(BUTTON_EVENT, ESP_EVENT_ANY_ID, main_event_handler, NULL, NULL));
 
-    led_status = led_status_init(2, true);
-
-
-    // Initialise underlying TCP/IP stack (deinit is not supported, and init should only be called once on application start)
-    #ifdef CONFIG_IDF_TARGET_ESP32
-        ESP_ERROR_CHECK(esp_netif_init());             // previously tcpip_adapter_init()
-        esp_netif_create_default_wifi_sta();
-        esp_netif_create_default_wifi_ap();
-    #elif CONFIG_IDF_TARGET_ESP8266
-        tcpip_adapter_init();
-    #endif
-
-    my_wifi_init();
-
-
-/*
     esp_app_desc_t app_desc;
     const esp_partition_t *ota0_partition;
     ota0_partition = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, NULL);
@@ -550,13 +511,22 @@ void app_main(void)
 
     const esp_partition_t *ota1_partition;
     ota1_partition = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_1, NULL);
-    esp_ota_get_partition_description(ota1_partition, &app_desc);
-    ESP_LOGI(TAG, "ota1 version: %s", app_desc.version);
+    err = esp_ota_get_partition_description(ota1_partition, &app_desc);
+    if (err == ESP_OK) {
+        ESP_LOGI(TAG, "ota1 version: %s", app_desc.version);
+    } else if (err == ESP_ERR_NOT_FOUND) {
+        ESP_LOGW(TAG, "ota1 not found. no ota is likely to have occurred before");
+    } else {
+        ESP_LOGE(TAG, "ota1 error");
+    }
 
     const esp_partition_t *running = esp_ota_get_running_partition();
-    ESP_LOGI(TAG, "Running partition type %d subtype %d (offset 0x%08x)",
+    ESP_LOGI(TAG, "Running partition type %d subtype %d (offset 0x%" PRIx32 ")",
              running->type, running->subtype, running->address);
-*/
+
+    led_status = led_status_init(2, true);
+
+    my_wifi_init();
 
     // 1. button configuration
     button_config_t button_config = {
@@ -573,8 +543,7 @@ void app_main(void)
 
     start_animation_task();
 
-
-    vTaskDelay(50);
+    vTaskDelay(pdMS_TO_TICKS(50));
 
     // I have had my program work on a DevKit module, but fail on a TinyPico module.
     //   App rollback ensures everything starts OK and sets the image valid. Otherwise, on the next reboot, it will rollback.
