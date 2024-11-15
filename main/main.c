@@ -346,13 +346,16 @@ void init_accessory() {
     homekit_service_t* services[4 + NUM_ANIMATIONS]; 
     homekit_service_t** s = services;
 
+    esp_app_desc_t app_desc;
+    const esp_partition_t *running = esp_ota_get_running_partition();
+    esp_ota_get_partition_description(running, &app_desc);
 
     *(s++) = NEW_HOMEKIT_SERVICE(ACCESSORY_INFORMATION, .characteristics=(homekit_characteristic_t*[]) {
         NEW_HOMEKIT_CHARACTERISTIC(NAME, name_value),
-        NEW_HOMEKIT_CHARACTERISTIC(MANUFACTURER, "MikeKit"),
-        NEW_HOMEKIT_CHARACTERISTIC(SERIAL_NUMBER, "037A3BBBF29D"),
-        NEW_HOMEKIT_CHARACTERISTIC(MODEL, "AnimLights"),
-        NEW_HOMEKIT_CHARACTERISTIC(FIRMWARE_REVISION, "0.1"),
+        NEW_HOMEKIT_CHARACTERISTIC(MANUFACTURER, "Riksman"),
+        NEW_HOMEKIT_CHARACTERISTIC(SERIAL_NUMBER, name_value),
+        NEW_HOMEKIT_CHARACTERISTIC(MODEL, "TinyPICO Nano"),
+        NEW_HOMEKIT_CHARACTERISTIC(FIRMWARE_REVISION, app_desc.version),
         NEW_HOMEKIT_CHARACTERISTIC(IDENTIFY, status_led_identify),
         NULL
     });

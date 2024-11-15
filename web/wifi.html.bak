@@ -888,7 +888,7 @@ function performRestart(){
 	});
 }
 
-/** Update ota **/
+/** Update .bin **/
 document.querySelector('#selected-file').addEventListener('change', (e) => {	
 	var x = document.querySelector("#selected-file");
 	var file = x.files[0];
