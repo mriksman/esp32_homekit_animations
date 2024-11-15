@@ -7,7 +7,7 @@
 
 #include "esp_ota_ops.h"
 #include "esp_image_format.h"
-
+#include "esp_mac.h"
 #include "esp_event.h"
 
 #include "nvs.h"

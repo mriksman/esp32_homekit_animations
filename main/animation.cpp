@@ -13,6 +13,7 @@ static const char *TAG = "anim";
 #include <NeoPixelAnimator.h>
 #include "NeoStripTopology.h"
 
+#include "esp_random.h"
 #include "animation.h"
 
 class MyRingsLayout 

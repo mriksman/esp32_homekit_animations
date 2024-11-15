@@ -7,8 +7,9 @@
 
 #include "esp_event.h"                          // For esp_event_base_t
 #include "esp_err.h"
+#include "esp_mac.h"
+#include "esp_netif.h"
 
-#include "esp_wifi_types.h"
 #include "esp_wifi.h"
 //#include "esp_timer.h"
 
@@ -42,7 +43,7 @@ static void retry_connect_callback(TimerHandle_t timer) {
     if( xSemaphoreTake(g_wifi_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
         esp_wifi_connect();
     } else {
-        ESP_LOGI(TAG, "Wi-Fi scan in progress");
+        ESP_LOGW(TAG, "cannot take semaphore. wi-fi busy (retry_connect_callback)");
     }
 }
 
@@ -63,16 +64,10 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
             err = esp_wifi_ap_get_sta_list(&connected_clients);
             ESP_LOGI(TAG, "num stations left %d, errno %d", connected_clients.num, err);
 
-            #ifdef CONFIG_IDF_TARGET_ESP32
-                esp_netif_ip_info_t ip_info;
-                esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-                esp_netif_get_ip_info(netif, &ip_info);
-                bool if_status = esp_netif_is_netif_up(netif);
-            #elif CONFIG_IDF_TARGET_ESP8266
-                tcpip_adapter_ip_info_t ip_info;
-                ESP_ERROR_CHECK(tcpip_adapter_get_ip_info(TCPIP_ADAPTER_IF_STA, &ip_info));
-                bool if_status = tcpip_adapter_is_netif_up(TCPIP_ADAPTER_IF_STA);
-            #endif
+            esp_netif_ip_info_t ip_info;
+            esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+            esp_netif_get_ip_info(netif, &ip_info);
+            bool if_status = esp_netif_is_netif_up(netif);
 
             // if the ESP is connected to an AP (router), and the last client disconnects, stop softAP
             if (if_status && err == ESP_OK && connected_clients.num == 0) {
@@ -85,20 +80,17 @@ static void wifi_event_handler(void* arg, esp_event_base_t event_base,
             esp_wifi_connect();
         } 
         else if (event_id == WIFI_EVENT_STA_DISCONNECTED) {
-
-            #ifdef CONFIG_IDF_TARGET_ESP8266
-                // ESP8266 RTOS SDK will continually retry every 2 seconds. To override, 
-                //  (and to keep consistent with ESP-IDF) call esp_wifi_disconnect()
-                esp_wifi_disconnect();
-            #endif
-
             // Connect failed/finished, give back Mutex.
             xSemaphoreGive(g_wifi_mutex);
 
             if (s_retry_num < MAXIMUM_RETRY) {
-                esp_wifi_connect();
+                if( xSemaphoreTake(g_wifi_mutex, pdMS_TO_TICKS(100)) == pdTRUE) {
+                    esp_wifi_connect();
+                } else {
+                    ESP_LOGW(TAG, "cannot take semaphore. wi-fi busy (s_retry_num < MAXIMUM_RETRY)");
+                }
                 s_retry_num++;
-                ESP_LOGI(TAG, "Retry esp_wifi_connect() attempt %d of %d", s_retry_num, MAXIMUM_RETRY);
+                ESP_LOGI(TAG, "retry esp_wifi_connect() attempt %d of %d", s_retry_num, MAXIMUM_RETRY);
             } else {
                 wifi_mode_t wifi_mode;
                 esp_wifi_get_mode(&wifi_mode);
@@ -171,22 +163,33 @@ void stop_ap_prov() {
 }
 
 void my_wifi_init() {
+
     vSemaphoreCreateBinary(g_wifi_mutex);
 
-    // esp_event_handler_register is being deprecated
-    #ifdef CONFIG_IDF_TARGET_ESP32
-        ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_AP_STACONNECTED, wifi_event_handler, NULL, &wifi_ap_staconnected));
-        ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_AP_STADISCONNECTED, wifi_event_handler, NULL, &wifi_ap_stadisconnected));
-        ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_STA_START, wifi_event_handler, NULL, &wifi_sta_start));
-        ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, wifi_event_handler, NULL, &wifi_sta_disconnected));
-        ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL, &ip_got_ip));
-    #elif CONFIG_IDF_TARGET_ESP8266
-        ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_STACONNECTED, wifi_event_handler, NULL));
-        ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_AP_STADISCONNECTED, wifi_event_handler, NULL));
-        ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_START, wifi_event_handler, NULL));
-        ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, wifi_event_handler, NULL));
-        ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL));
-    #endif
+    ESP_ERROR_CHECK(esp_netif_init());             // previously tcpip_adapter_init()
+    esp_netif_create_default_wifi_sta();
+    esp_netif_create_default_wifi_ap();
+
+    // Changes the IP address used for the soft AP. 
+    // Get the handle for the Soft AP network interface
+    esp_netif_t* netif = esp_netif_get_handle_from_ifkey("WIFI_AP_DEF");
+
+    // Define the IP address, gateway, and netmask
+    esp_netif_ip_info_t ip_info;
+    ip_info.ip.addr = esp_ip4addr_aton("192.168.8.1");   // Set IP address
+    ip_info.gw.addr = esp_ip4addr_aton("192.168.8.1");   // Set Gateway
+    ip_info.netmask.addr = esp_ip4addr_aton("255.255.252.0");  // Set Netmask
+    
+    // Stop the DHCP server, set new IP info, and start the DHCP server
+    esp_netif_dhcps_stop(netif);                        // Stop DHCP server
+    esp_netif_set_ip_info(netif, &ip_info);             // Set new IP info
+    esp_netif_dhcps_start(netif);                       // Start DHCP server
+
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_AP_STACONNECTED, wifi_event_handler, NULL, &wifi_ap_staconnected));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_AP_STADISCONNECTED, wifi_event_handler, NULL, &wifi_ap_stadisconnected));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_STA_START, wifi_event_handler, NULL, &wifi_sta_start));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, wifi_event_handler, NULL, &wifi_sta_disconnected));
+    ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, IP_EVENT_STA_GOT_IP, wifi_event_handler, NULL, &ip_got_ip));
 
     wifi_init_config_t cfg = WIFI_INIT_CONFIG_DEFAULT();
     ESP_ERROR_CHECK(esp_wifi_init(&cfg));
@@ -204,50 +207,5 @@ void my_wifi_init() {
     g_stop_delay_timer = xTimerCreate(
         "delay_stop_ap", pdMS_TO_TICKS(STOP_AP_DELAY), pdFALSE, NULL, stop_delay_callback
     );
-
-}
-
-esp_err_t my_wifi_deinit() {
-
-    esp_err_t err;
-
-    if (g_retry_connect_timer) {
-        xTimerDelete(g_retry_connect_timer, 0);
-    }
-    if (g_stop_delay_timer) {
-        xTimerDelete(g_stop_delay_timer, 0);
-    }
-    if (g_wifi_mutex) {
-        vSemaphoreDelete(g_wifi_mutex);
-    }
-    g_retry_connect_timer = NULL;
-    g_stop_delay_timer = NULL;
-    g_wifi_mutex = NULL;
-
-    ESP_ERROR_CHECK(esp_event_handler_instance_unregister(WIFI_EVENT, WIFI_EVENT_AP_STACONNECTED, wifi_ap_staconnected));
-    ESP_ERROR_CHECK(esp_event_handler_instance_unregister(WIFI_EVENT, WIFI_EVENT_AP_STADISCONNECTED, wifi_ap_stadisconnected));
-    ESP_ERROR_CHECK(esp_event_handler_instance_unregister(WIFI_EVENT, WIFI_EVENT_STA_START, wifi_sta_start));
-    ESP_ERROR_CHECK(esp_event_handler_instance_unregister(WIFI_EVENT, WIFI_EVENT_STA_DISCONNECTED, wifi_sta_disconnected));
-    ESP_ERROR_CHECK(esp_event_handler_instance_unregister(IP_EVENT, IP_EVENT_STA_GOT_IP, ip_got_ip));
-
-
-    err = esp_wifi_disconnect();
-    if (err == ESP_ERR_WIFI_NOT_INIT) {
-        ESP_LOGI(TAG, "cannot disconnect. wifi deinit"); 
-        return err;
-    }
-    err = esp_wifi_stop();
-    if (err == ESP_ERR_WIFI_NOT_INIT) {
-        ESP_LOGI(TAG, "cannot stop. wifi deinit"); 
-        return err;
-    }
-    err = esp_wifi_deinit();
-    if (err == ESP_ERR_WIFI_NOT_INIT) {
-        ESP_LOGI(TAG, "cannot deinit. wifi already deinit"); 
-        return err;
-    }
-
-
-    return err;
 
 }

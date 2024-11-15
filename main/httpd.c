@@ -2,6 +2,7 @@
 #include "freertos/task.h"
 #include <freertos/timers.h>
 #include <sys/param.h>                          // MIN MAX
+#include <inttypes.h>
 
 #include "esp_http_server.h"
 #include "esp_wifi.h"
@@ -23,10 +24,8 @@ static const char *TAG = "myhttpd";
 
 static httpd_handle_t server = NULL;
 
-#ifdef CONFIG_IDF_TARGET_ESP32
-    esp_event_handler_instance_t wifi_event_handler_instance;
-    esp_event_handler_instance_t ip_event_handler_instance;
-#endif
+esp_event_handler_instance_t wifi_event_handler_instance;
+esp_event_handler_instance_t ip_event_handler_instance;
 
 char log_buf[LOG_BUF_MAX_LINE_SIZE];
 static TaskHandle_t t_sse_task_handle;
@@ -37,32 +36,13 @@ static QueueHandle_t q_sse_message_queue;
 // needs to make sure it has an updated copy
 volatile int sse_sockets[MAX_SSE_CLIENTS];
 
-#ifdef CONFIG_IDF_TARGET_ESP32
-    int sse_logging_vprintf(const char *format, va_list arg) {
-        vsprintf(log_buf, format, arg);
-        xQueueSendToBack(q_sse_message_queue, log_buf, 0);
+int sse_logging_vprintf(const char *format, va_list arg) {
+    vsprintf(log_buf, format, arg);
+    xQueueSendToBack(q_sse_message_queue, log_buf, 0);
 
-        // still send to console
-        return vprintf(format, arg);
-    }
-#elif CONFIG_IDF_TARGET_ESP8266
-    int sse_logging_putchar(int chr) {
-        if(chr == '\n'){
-            // send without the '\n'
-            xQueueSendToBack(q_sse_message_queue, log_buf, 0);
-            // 'clear' string
-            log_buf[0] = '\0';    
-        } else {
-            size_t len = strlen(log_buf);
-            if (len < LOG_BUF_MAX_LINE_SIZE - 1) {
-                log_buf[len] = chr;
-                log_buf[len+1] = '\0';
-            }
-        }
-        // still send to console
-        return putchar(chr);
-    }
-#endif
+    // still send to console
+    return vprintf(format, arg);
+}
 
 
 void send_sse_message (char* message, char* event) {
@@ -117,16 +97,10 @@ static void status_json_sse_handler()
     wifi_config_t wifi_cfg;
     esp_wifi_get_config(ESP_IF_WIFI_STA, &wifi_cfg);
 
-    #ifdef CONFIG_IDF_TARGET_ESP32
-        esp_netif_ip_info_t ip_info;
-        esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
-        esp_netif_get_ip_info(netif, &ip_info);
-        bool if_status = esp_netif_is_netif_up(netif);
-    #elif CONFIG_IDF_TARGET_ESP8266
-        tcpip_adapter_ip_info_t ip_info;
-        ESP_ERROR_CHECK(tcpip_adapter_get_ip_info(TCPIP_ADAPTER_IF_STA, &ip_info));
-        bool if_status = tcpip_adapter_is_netif_up(TCPIP_ADAPTER_IF_STA);
-    #endif
+    esp_netif_ip_info_t ip_info;
+    esp_netif_t *netif = esp_netif_get_handle_from_ifkey("WIFI_STA_DEF");
+    esp_netif_get_ip_info(netif, &ip_info);
+    bool if_status = esp_netif_is_netif_up(netif);
 
     cJSON_AddItemToObject(root, "ssid", cJSON_CreateString((const char *)wifi_cfg.sta.ssid));
     snprintf(ip_buf, 17, IPSTR, IP2STR(&ip_info.ip));
@@ -150,8 +124,7 @@ static void status_json_sse_handler()
 
 }
 
-static void wifi_event_handler(void* arg, esp_event_base_t event_base,
-                                    int32_t event_id, void* event_data) {
+static void wifi_event_handler(void* arg, esp_event_base_t event_base, int32_t event_id, void* event_data) {
     status_json_sse_handler();
 }
 
@@ -172,11 +145,7 @@ void free_sse_ctx_func(void *ctx)
 esp_err_t server_side_event_registration_handler(httpd_req_t *req)
 {
     // disable sending to sse_socket until a proper HTTP 200 OK response has been sent back to client
-    #ifdef CONFIG_IDF_TARGET_ESP32
-        esp_log_set_vprintf(vprintf);
-    #elif CONFIG_IDF_TARGET_ESP8266
-        esp_log_set_putchar(putchar);
-    #endif
+    esp_log_set_vprintf(vprintf);
     
     int len;
     char buffer[150];
@@ -224,11 +193,7 @@ esp_err_t server_side_event_registration_handler(httpd_req_t *req)
     send_sse_message(buffer, "firmware");
 
     // enable sse logging again
-    #ifdef CONFIG_IDF_TARGET_ESP32
-        esp_log_set_vprintf(&sse_logging_vprintf);
-    #elif CONFIG_IDF_TARGET_ESP8266
-        esp_log_set_putchar(&sse_logging_putchar);
-    #endif
+    esp_log_set_vprintf(&sse_logging_vprintf);
 
     return ESP_OK;
 }
@@ -252,6 +217,7 @@ esp_err_t ap_json_handler(httpd_req_t *req)
     root = cJSON_CreateArray();
 
     uint16_t ap_count = 0;
+    esp_err_t err;
 
     if( xSemaphoreTake(*(get_wifi_mutex()), pdMS_TO_TICKS(500)) == pdTRUE) {
         esp_wifi_scan_start(NULL, true);
@@ -260,20 +226,27 @@ esp_err_t ap_json_handler(httpd_req_t *req)
         ESP_ERROR_CHECK(esp_wifi_scan_get_ap_num(&ap_count));
 
         wifi_ap_record_t *ap_info = (wifi_ap_record_t *)malloc(sizeof(wifi_ap_record_t) * ap_count);
-        ESP_ERROR_CHECK(esp_wifi_scan_get_ap_records(&ap_count, ap_info));
+//        ESP_ERROR_CHECK(esp_wifi_scan_get_ap_records(&ap_count, ap_info));
+        err = esp_wifi_scan_get_ap_records(&ap_count, ap_info);
 
-        ESP_LOGI(TAG, "Total APs scanned = %u", ap_count);
-        for (int i = 0; i < ap_count && i <= MAX_AP_COUNT; i++) {
-            cJSON_AddItemToArray(root, fld = cJSON_CreateObject());
-            cJSON_AddItemToObject(fld, "ssid", cJSON_CreateString((const char *)ap_info[i].ssid));
-            cJSON_AddItemToObject(fld, "chan", cJSON_CreateNumber(ap_info[i].primary));
-            cJSON_AddItemToObject(fld, "rssi", cJSON_CreateNumber(ap_info[i].rssi));
-            cJSON_AddItemToObject(fld, "auth", cJSON_CreateNumber(ap_info[i].authmode));
+        if (err == ESP_OK) {
+            ESP_LOGI(TAG, "Total APs scanned = %u", ap_count);
+            for (int i = 0; i < ap_count && i <= MAX_AP_COUNT; i++) {
+                cJSON_AddItemToArray(root, fld = cJSON_CreateObject());
+                cJSON_AddItemToObject(fld, "ssid", cJSON_CreateString((const char *)ap_info[i].ssid));
+                cJSON_AddItemToObject(fld, "chan", cJSON_CreateNumber(ap_info[i].primary));
+                cJSON_AddItemToObject(fld, "rssi", cJSON_CreateNumber(ap_info[i].rssi));
+                cJSON_AddItemToObject(fld, "auth", cJSON_CreateNumber(ap_info[i].authmode));
+            }
         }
+        else {
+            ESP_LOGW(TAG, "error in esp_wifi_scan_get_ap_records");
+        }
+
         free(ap_info);
     }
     else {
-        ESP_LOGI(TAG, "Scan or connect in progress");
+       ESP_LOGW(TAG, "cannot take semaphore. wi-fi busy (ap_json_handler)");
     }
 
     out = cJSON_PrintUnformatted(root);
@@ -371,31 +344,14 @@ esp_err_t restart_json_handler(httpd_req_t *req)
     cJSON *root = cJSON_Parse(buf);
     cJSON *reset_nvs = cJSON_GetObjectItem(root, "reset-nvs");
     cJSON *reset_homekit = cJSON_GetObjectItem(root, "reset-homekit");
-    cJSON *update = cJSON_GetObjectItem(root, "update");
 
-    // if 'update' is flagged, don't perform any resets of NVS of HomeKit
-    if (cJSON_IsTrue(update)) {
-        const esp_partition_t *app0_partition;
-        app0_partition = esp_partition_find_first(ESP_PARTITION_TYPE_APP, ESP_PARTITION_SUBTYPE_APP_OTA_0, NULL);
-
-        err = esp_ota_set_boot_partition(app0_partition);
-        if (err != ESP_OK) {
-            ESP_LOGW(TAG, "Unable to set boot partition to '%s' at offset 0x%x",
-                            app0_partition->label, app0_partition->address);
-        } else {
-            ESP_LOGW(TAG, "Booting to '%s' at offset 0x%x. Restarting...",
-                             app0_partition->label, app0_partition->address);
-        }
-    } 
-    else {
-        if (cJSON_IsTrue(reset_nvs)) {
-            nvs_flash_erase();
-        }
-        if (cJSON_IsTrue(reset_homekit)) {
-            homekit_server_reset();
-        }
+    if (cJSON_IsTrue(reset_nvs)) {
+        nvs_flash_erase();
     }
-
+    if (cJSON_IsTrue(reset_homekit)) {
+        homekit_server_reset();
+    }
+    
     if (err == ESP_OK) {
         ESP_LOGW(TAG, "Reset nvs = %d, homekit = %d. Restarting...", 
             cJSON_IsTrue(reset_nvs), cJSON_IsTrue(reset_homekit));
@@ -418,19 +374,18 @@ esp_err_t restart_json_handler(httpd_req_t *req)
 }
 
 
-/* POST handler for /updateboot. 
-   Use curl to POST binary file to be updated to OTA_0 */
-esp_err_t update_boot_handler(httpd_req_t *req)
+/* POST handler for /otaupdate. */
+esp_err_t otaupdate_handler(httpd_req_t *req)
 {
     const esp_partition_t *configured = esp_ota_get_boot_partition();
     const esp_partition_t *running = esp_ota_get_running_partition();
 
     if (configured != running) {
-        ESP_LOGW(TAG, "Configured OTA boot partition at offset 0x%08x, but running from offset 0x%08x",
+        ESP_LOGW(TAG, "Configured OTA boot partition at offset 0x%" PRIx32 ", but running from offset 0x%" PRIx32,
                  configured->address, running->address);
         ESP_LOGW(TAG, "(This can happen if either the OTA boot data or preferred boot image become corrupted somehow.)");
     }
-    ESP_LOGI(TAG, "Running partition type %d subtype %d (offset 0x%08x)",
+    ESP_LOGI(TAG, "Running partition type %d subtype %d (offset 0x%" PRIx32 ")",
              running->type, running->subtype, running->address);
 
 
@@ -449,7 +404,7 @@ esp_err_t update_boot_handler(httpd_req_t *req)
     const esp_partition_t *update_partition = NULL;
 
     update_partition = esp_ota_get_next_update_partition(NULL);
-    ESP_LOGI(TAG, "Writing to partition subtype %d at offset 0x%08x",
+    ESP_LOGI(TAG, "Writing to partition subtype %d at offset 0x%" PRIx32,
              update_partition->subtype, update_partition->address);
 
     if (update_partition == NULL) {
@@ -458,7 +413,7 @@ esp_err_t update_boot_handler(httpd_req_t *req)
 
     // File cannot be larger than partition size
     if (update_partition != NULL && req->content_len > update_partition->size) {
-        ESP_LOGE(TAG, "Content-Length of %d larger than partition size of %d", req->content_len, update_partition->size); 
+        ESP_LOGE(TAG, "Content-Length of %d larger than partition size of %" PRIu32, req->content_len, update_partition->size); 
         err = ESP_ERR_INVALID_SIZE;
     }
 
@@ -486,7 +441,7 @@ esp_err_t update_boot_handler(httpd_req_t *req)
                     ESP_LOGE(TAG, "Error esp_ota_begin()"); 
                 } 
                 else {
-                    ESP_LOGI(TAG, "Writing to partition '%s' at offset 0x%x",
+                    ESP_LOGI(TAG, "Writing to partition '%s' at offset 0x%" PRIx32,
                         update_partition->label, update_partition->address);
                 }
             }
@@ -534,7 +489,7 @@ esp_err_t update_boot_handler(httpd_req_t *req)
     err = esp_ota_set_boot_partition(update_partition);
 
     const esp_partition_t *boot_partition = esp_ota_get_boot_partition();
-    ESP_LOGW(TAG, "Next boot partition '%s' at offset 0x%x",
+    ESP_LOGW(TAG, "Next boot partition '%s' at offset 0x%" PRIx32,
         boot_partition->label, boot_partition->address);
 
     if (err == ESP_OK) {
@@ -806,34 +761,24 @@ esp_err_t start_webserver(void)
         };
         httpd_register_uri_handler(server, &server_side_event_registration_page);
 
-        // Used to update OTA
+        // OTA
         httpd_uri_t update_boot_page = {
-            .uri       = "/updateboot",
+            .uri       = "/otaupdate",
             .method    = HTTP_POST,
-            .handler   = update_boot_handler,
+            .handler   = otaupdate_handler,
             .user_ctx  = NULL
         };
         httpd_register_uri_handler(server, &update_boot_page);
 
-        // esp_event_handler_register is being deprecated
-        #ifdef CONFIG_IDF_TARGET_ESP32
-            ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL, &wifi_event_handler_instance));
-            ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL, &ip_event_handler_instance));
-        #elif CONFIG_IDF_TARGET_ESP8266
-            ESP_ERROR_CHECK(esp_event_handler_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL));
-            ESP_ERROR_CHECK(esp_event_handler_register(IP_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL));
-        #endif
+
+        ESP_ERROR_CHECK(esp_event_handler_instance_register(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL, &wifi_event_handler_instance));
+        ESP_ERROR_CHECK(esp_event_handler_instance_register(IP_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler, NULL, &ip_event_handler_instance));
         
         // Task to accept messages from queue and send to SSE clients
         q_sse_message_queue = xQueueCreate( 10, sizeof(char)*LOG_BUF_MAX_LINE_SIZE );
         xTaskCreate(&sse_logging_task, "sse", 2048, NULL, 4, &t_sse_task_handle);
 
-        #ifdef CONFIG_IDF_TARGET_ESP32
-            esp_log_set_vprintf(&sse_logging_vprintf);
-        #elif CONFIG_IDF_TARGET_ESP8266
-            esp_log_set_putchar(&sse_logging_putchar);
-        #endif
-        
+        esp_log_set_vprintf(&sse_logging_vprintf);     
 
         return ESP_OK;
     }
@@ -844,21 +789,11 @@ esp_err_t start_webserver(void)
 
 void stop_webserver(void)
 {
-    // esp_event_handler_register is being deprecated
-    #ifdef CONFIG_IDF_TARGET_ESP32
-        ESP_ERROR_CHECK(esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler_instance));
-        ESP_ERROR_CHECK(esp_event_handler_instance_unregister(IP_EVENT, ESP_EVENT_ANY_ID, &ip_event_handler_instance));
-    #elif CONFIG_IDF_TARGET_ESP8266
-        ESP_ERROR_CHECK(esp_event_handler_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler));
-        ESP_ERROR_CHECK(esp_event_handler_unregister(IP_EVENT, ESP_EVENT_ANY_ID, wifi_event_handler));
-    #endif
+    ESP_ERROR_CHECK(esp_event_handler_instance_unregister(WIFI_EVENT, ESP_EVENT_ANY_ID, &wifi_event_handler_instance));
+    ESP_ERROR_CHECK(esp_event_handler_instance_unregister(IP_EVENT, ESP_EVENT_ANY_ID, &ip_event_handler_instance));
     
-    #ifdef CONFIG_IDF_TARGET_ESP32
-        esp_log_set_vprintf(vprintf);
-    #elif CONFIG_IDF_TARGET_ESP8266
-        esp_log_set_putchar(putchar);
-    #endif
-    
+    esp_log_set_vprintf(vprintf);
+        
     vTaskDelete(t_sse_task_handle);
     vQueueDelete(q_sse_message_queue);
 

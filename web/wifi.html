@@ -972,7 +972,7 @@ function performUpdate(){
 	var x = document.querySelector("#selected-file");
 	var file = x.files[0];
 
-	fetch("/updateboot", {
+	fetch("/otaupdate", {
 		method: 'POST',
 		cache: 'no-store',
 		headers: {
