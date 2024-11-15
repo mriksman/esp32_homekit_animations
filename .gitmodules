@@ -1,3 +1,12 @@
 [submodule "components/neopixelbus"]
 	path = components/neopixelbus
 	url = https://github.com/mriksman/esp-neopixelbus.git
+[submodule "components/http-parser"]
+	path = components/http-parser
+	url = https://github.com/maximkulkin/esp-http-parser.git
+[submodule "components/homekit"]
+	path = components/homekit
+	url = https://github.com/mriksman/esp-homekit.git
+[submodule "components/wolfssl"]
+	path = components/wolfssl
+	url = https://github.com/mriksman/esp-wolfssl.git
