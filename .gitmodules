@@ -10,3 +10,9 @@
 [submodule "components/wolfssl"]
 	path = components/wolfssl
 	url = https://github.com/mriksman/esp-wolfssl.git
+[submodule "components/button"]
+	path = components/button
+	url = https://github.com/mriksman/esp-button.git
+[submodule "components/led-status"]
+	path = components/led-status
+	url = https://github.com/mriksman/esp-led-status.git
