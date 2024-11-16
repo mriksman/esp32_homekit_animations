@@ -539,6 +539,9 @@ void app_main(void)
 
     init_accessory();
     homekit_server_init(&config);
+    // homekit_server_init starts a task which then initialises the storage, so sometimes this call causes an assert partition != null
+    // therefore, delay it
+    vTaskDelay(pdMS_TO_TICKS(50));
     paired = homekit_is_paired();
 
     start_animation_task();
