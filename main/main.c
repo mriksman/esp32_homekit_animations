@@ -444,12 +444,18 @@ void init_accessory() {
                 .callback=HOMEKIT_CHARACTERISTIC_CALLBACK(state_change_on_callback)
             ),
             NEW_HOMEKIT_CHARACTERISTIC(
-                CUSTOM, 0,
+                CUSTOM,
                 .type = "02B77067-DA5D-493C-829D-F6C5DCFE5C28",
                 .description = "Remote Switch ID",
-                .format = homekit_format_int,
+                .format = homekit_format_uint8,
                 .min_value = (float[]) {0},
                 .max_value = (float[]) {6},
+                .min_step = (float[]) {1},
+                .valid_values = {
+                    .count = 7,
+                    .values = (uint8_t[]) { 0, 1, 2, 3, 4, 5, 6 },
+                },
+                .value = HOMEKIT_UINT8_(0),
                 .permissions = homekit_permissions_paired_read
                              | homekit_permissions_paired_write,
             ),
