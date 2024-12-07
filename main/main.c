@@ -62,8 +62,8 @@ void state_change_on_callback(homekit_characteristic_t *_ch, homekit_value_t val
 
     ESP_LOGI(TAG, "%s", _ch->description);
 
-    homekit_service_t *light_service     = homekit_service_by_type(_ch->service->accessory, HOMEKIT_SERVICE_LIGHTBULB);
-    homekit_service_t *tv_service        = homekit_service_by_type(_ch->service->accessory, HOMEKIT_SERVICE_TELEVISION);
+    homekit_service_t *light_service     = homekit_service_by_type(accessories[0], HOMEKIT_SERVICE_LIGHTBULB);
+    homekit_service_t *tv_service        = homekit_service_by_type(accessories[0], HOMEKIT_SERVICE_TELEVISION);
 
     homekit_characteristic_t *active     = homekit_service_characteristic_by_type(tv_service, HOMEKIT_CHARACTERISTIC_ACTIVE);
     homekit_characteristic_t *active_id  = homekit_service_characteristic_by_type(tv_service, HOMEKIT_CHARACTERISTIC_ACTIVE_IDENTIFIER);
