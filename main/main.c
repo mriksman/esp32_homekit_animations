@@ -544,13 +544,24 @@ void app_main(void)
 
 
     init_accessory();
-    homekit_server_init(&config);
-    // homekit_server_init starts a task which then initialises the storage, so sometimes this call causes an assert partition != null
-    // therefore, delay it
-    vTaskDelay(pdMS_TO_TICKS(50));
-    paired = homekit_is_paired();
 
-    start_animation_task();
+    const esp_partition_t *homekit_partition = esp_partition_find_first(ESP_PARTITION_TYPE_ANY, ESP_PARTITION_SUBTYPE_ANY, "homekit");
+
+    if (homekit_partition && 
+        homekit_partition->size == 0x1000 &&
+        homekit_partition->type == ESP_PARTITION_TYPE_DATA && 
+        homekit_partition->subtype == ESP_PARTITION_SUBTYPE_DATA_HOMEKIT) {
+            homekit_server_init(&config);
+            // homekit_server_init starts a task which then initialises the storage, so sometimes this call causes an assert partition != null
+            // therefore, delay it
+            vTaskDelay(pdMS_TO_TICKS(50));
+            paired = homekit_is_paired();
+
+            start_animation_task();
+    }
+    else {
+        ESP_LOGW(TAG, "HomeKit partition not found or does not meet the required criteria");
+    }
 
     vTaskDelay(pdMS_TO_TICKS(50));
 
