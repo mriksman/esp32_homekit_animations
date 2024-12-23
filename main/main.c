@@ -172,7 +172,7 @@ void state_change_on_callback(homekit_characteristic_t *_ch, homekit_value_t val
     }
 
     // reset remote custom id back to 0 (local).
-    custom_id->value = HOMEKIT_INT(0);
+    custom_id->value = HOMEKIT_UINT8(0);
 }
 
 
